@@ -1,0 +1,58 @@
+[build-system]
+requires = ["flit_core >=3.12.0,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "atlas-rag"
+version = "0.0.5"
+authors = [
+    {name = "Jiaxin Bai", email = "jbai@connect.ust.hk"},
+    {name = "Hong Ting TSANG", email = "httsangaj@connect.ust.hk"},
+    {name = "Haoyu Huang", email = "haoyuhuang@link.cuhk.edu.hk"},
+]
+description = "AutoSchemaKG, a framework for fully autonomous knowledge graph construction that eliminates the need for predefined schemas."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = [
+    "retrieval-augmented-generation",
+    "knowledge-graph",
+    "nlp",
+]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "numpy>=1.26.0, <2.0.0",
+    "networkx>=3.1",
+    "tqdm>=4.65.0",
+    "jsonschema>=4.17.3",
+    "neo4j>=5.8.0",
+    "fastapi>=0.95.0",
+    "uvicorn>=0.21.0",
+    "openai>=1.0.0",
+    "tenacity>=9.1.2",
+    "pandas>=2.0.0",
+    "sentence-transformers>=2.7.0",
+    "transformers",
+    "datasets",
+    "einops",
+    "accelerate>=1.7.0",
+    "nltk",
+    "graphdatascience",
+    "azure-ai-projects",
+    "azure-cli",
+    "azure-ai-inference",
+    "azure-identity",
+    "json_repair"
+]
+[project.optional-dependencies]
+nvembed = [
+    "transformers>=4.42.4,<=4.47.1",
+    "sentence-transformers==2.7.0"
+]

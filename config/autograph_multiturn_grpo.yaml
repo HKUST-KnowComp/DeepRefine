@@ -1,0 +1,51 @@
+hydra:
+  run:
+    dir: /data/haoyuhuang/ray_tmp/outputs
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 1024
+  max_response_length: 1024
+  train_batch_size: 256
+  return_raw_chat: True
+  shuffle: False
+  apply_chat_template_kwargs:
+    enable_thinking: False
+
+actor_rollout_ref:
+  hybrid_engine: True
+  rollout:
+    name: sglang_async
+    autograph_mode: null  # Set to "autograph" or "autorefine" for AutoGraph work mode
+    multi_turn:
+      enable: True
+      chat_template_kwargs:
+        enable_thinking: False
+    use_api: True
+    rag_method: re_edge  # subgraph by default
+    text_linking: False
+    freeze_answer_api: False
+    set_llm_judge_model: False
+    reranker_model_name: Qwen/Qwen3-Embedding-0.6B-batch
+    llm_judge_model_name: Qwen/Qwen2.5-7B-Instruct # LLM model name for judging the generated answer
+    iterative: False
+    tight: False
+    reward_function: gbd_reward # available: f1_reward, deducible_reward, recall_reward, gbd_reward
+    filter_repetition_rollout: True # Whether filter out the excessive repetition in rollout stage
+    filter_repetition_threshold: 0.9 # Threshold for filtering excessive repetition in rollout stage
+    gen_acc_judge_base_url: https://yunwu.ai/v1
+    gen_acc_judge_api_key: your_api_key
+    gen_acc_judge_model: deepseek-v3
+custom_reward_function:
+  reward_kwargs:
+    triple_repetition_penalty: 0.0
+    break_correct_draft_penalty: -0.4
+    q00_gain: 0.0
+    q01_gain: 1.0
+    q10_gain: -0.25
+    q11_gain: 0.2

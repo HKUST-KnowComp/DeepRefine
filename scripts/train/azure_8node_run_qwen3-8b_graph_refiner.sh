@@ -1,0 +1,168 @@
+# run on 8xA100 40G
+# make sure your current working directory is the root of the project
+# export CUDA devices
+#!/bin/bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+export CUDA_LAUNCH_BLOCKING=0
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export HYDRA_FULL_ERROR=1
+
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+export TORCH_DISTRIBUTED_DEBUG=INFO
+export NCCL_DEBUG=INFO
+export GLOO_TIMEOUT_SECONDS=7200
+export TORCH_DISTRIBUTED_TIMEOUT=7200
+export NCCL_TIMEOUT=7200
+export GLOO_TIMEOUT=7200
+export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=7200
+export NCCL_IB_TIMEOUT=7200
+export TORCH_DISTRIBUTED_GLOO_TIMEOUT=7200
+
+export SWANLAB_LOG_DIR=/path_to_your_ray_tmp/swanlog
+export WANDB_DIR=/path_to_your_ray_tmp/wandb
+export WANDB_CACHE_DIR=/path_to_your_ray_tmp/wandb
+export WANDB_CONFIG_DIR=/path_to_your_ray_tmp/wandb
+export WANDB_DATA_DIR=/path_to_your_ray_tmp/wandb
+export WANDB_ARTIFACT_DIR=/path_to_your_ray_tmp/wandb
+export HF_DATASETS_CACHE=/path_to_your_ray_tmp/
+
+: "${DATA_ROOT:=/path_to_your_data}"
+: "${CHECKPOINT_ROOT:=/path_to_your_checkpoints/checkpoints}"
+: "${HF_HOME:=/path_to_your_models/models}"
+: "${RAY_TMPDIR:=/path_to_your_ray_tmp}"
+: "${TRANSFORMERS_CACHE:=/path_to_your_models/models}"
+: "${MODEL_ROOT:=/path_to_your_models/models}"
+
+export DATA_ROOT
+export CHECKPOINT_ROOT
+export HF_HOME
+export RAY_TMPDIR
+export TRANSFORMERS_CACHE
+export MODEL_ROOT
+
+mkdir -p "$RAY_TMPDIR"
+
+WANDB_API_KEY=""
+GEN_ACC_JUDGE_API_KEY=""
+# Print the values (for debugging)
+export WANDB_API_KEY
+set -x
+
+ulimit -n 65535
+
+CONFIG_PATH="/path_to_your_config/config"
+
+TEXT_LINKING="False" # available: True, False
+F1_REWARD="False" # available: True, False
+F1_GBD_REWARD="True" # available: True, False
+MIX_DATA="True" # available: True, False
+DEDUCE_REWARD="False"
+ITERATIVE="True"
+REFINEMTN="True"    # False for AR1
+BATCH_SIZE=8
+MICRO_BATCH_SIZE=1
+MINI_BATCH_SIZE=2
+GROUP_SIZE=2
+LR=5e-7
+
+
+TRAIN_DATA="${DATA_ROOT}/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+VAL_DATA="${DATA_ROOT}/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+MAX_ASSISTANT_TURN=6
+MAX_USER_TURN=6
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+reward_fn_file_path="verl/third_party/autograph_r1/gbd_reward.py"
+reward_function="gbd_reward"
+
+EXPERIMENT_NAME="Qwen3-8B-refinement-rl-gbd_reward-hotpotqa-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
+CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${EXPERIMENT_NAME}"
+
+python3 -m verl.trainer.main_ppo \
+    --config-path="$CONFIG_PATH" \
+    --config-name='autograph_multiturn_grpo' \
+    algorithm.adv_estimator=grpo \
+    algorithm.use_kl_in_reward=True \
+    data.train_batch_size=$BATCH_SIZE \
+    data.val_batch_size=$BATCH_SIZE \
+    data.max_prompt_length=8192 \
+    data.max_response_length=8192 \
+    data.filter_overlong_prompts=True \
+    data.shuffle=True \
+    data.truncation='middle' \
+    data.return_raw_chat=True \
+    data.apply_chat_template_kwargs.enable_thinking=False \
+    actor_rollout_ref.model.path=Qwen/Qwen3-8B \
+    actor_rollout_ref.actor.optim.lr=$LR \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$MINI_BATCH_SIZE \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=1e-4 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=1e-3 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.enable_activation_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.autograph_mode='autorefine' \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_model_len=16384 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
+    actor_rollout_ref.rollout.n=$GROUP_SIZE \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$MAX_ASSISTANT_TURN \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURN \
+    actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable \
+    actor_rollout_ref.rollout.multi_turn.interaction_config_path='config/interaction_config/refinement_interaction_config.yaml' \
+    actor_rollout_ref.rollout.multi_turn.use_inference_chat_template=True \
+    actor_rollout_ref.rollout.multi_turn.chat_template_kwargs.enable_thinking=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.rollout.gen_acc_judge_base_url='https://yunwu.ai/v1' \
+    actor_rollout_ref.rollout.gen_acc_judge_api_key="$GEN_ACC_JUDGE_API_KEY" \
+    actor_rollout_ref.rollout.gen_acc_judge_model='deepseek-v3' \
+    critic.strategy=fsdp2 \
+    reward_model.strategy=fsdp2 \
+    actor_rollout_ref.nccl_timeout=7200 \
+    trainer.critic_warmup=0 \
+    trainer.val_before_train=False \
+    trainer.logger=['console','wandb'] \
+    trainer.project_name='auto_graph_rl' \
+    trainer.experiment_name="${EXPERIMENT_NAME}" \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.total_training_steps=200 \
+    trainer.save_freq=25 \
+    trainer.test_freq=-1 \
+    trainer.ray_wait_register_center_timeout=7200 \
+    data.train_files="$TRAIN_DATA" \
+    data.val_files="$VAL_DATA"  \
+    trainer.default_local_dir="$CHECKPOINT_DIR" \
+    custom_reward_function.path="$reward_fn_file_path" \
+    actor_rollout_ref.rollout._target_=verl.third_party.autograph_r1.autograph_config.AutoGraphActorConfig \
+    actor_rollout_ref.rollout.use_api=True \
+    actor_rollout_ref.rollout.rag_method='re_edge' \
+    actor_rollout_ref.rollout.text_linking=$TEXT_LINKING \
+    actor_rollout_ref.rollout.freeze_answer_api=True \
+    actor_rollout_ref.rollout.iterative=$ITERATIVE \
+    actor_rollout_ref.rollout.tight=False \
+    actor_rollout_ref.rollout.reward_function=$reward_function \
+    actor_rollout_ref.rollout.set_llm_judge_model=True \
+    actor_rollout_ref.rollout.reranker_model_name='Qwen/Qwen3-Embedding-0.6B-batch' \
+    actor_rollout_ref.rollout.llm_judge_model_name='Qwen/Qwen2.5-7B-Instruct' \
+    actor_rollout_ref.rollout.skip_tokenizer_init=False \
+    custom_reward_function.reward_kwargs.triple_repetition_penalty=0.0 \
+    custom_reward_function.reward_kwargs.q00_gain=0.0 \
+    custom_reward_function.reward_kwargs.q01_gain=1.0 \
+    custom_reward_function.reward_kwargs.q10_gain=-0.3 \
+    custom_reward_function.reward_kwargs.q11_gain=0.2
