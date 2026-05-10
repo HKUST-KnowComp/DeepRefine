@@ -15,6 +15,11 @@
 
 </div>
 
+## News
+- [2026/5/10] Static quants of DeepRefine-v1-8B, [mradermacher/DeepRefine-v1-8B-GGUF](https://huggingface.co/mradermacher/DeepRefine-v1-8B-GGUF) has been released. Thanks to the community!
+
+
+
 ## 📊 Training Data Preprocessing
 
 We collect the raw training data of HotpotQA from https://hotpotqa.github.io/ and then construct the data samples for RL training through the following script:
