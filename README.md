@@ -2,7 +2,7 @@
 
 # ***DeepRefine***: Agent-Compiled Knowledge Refinement via Reinforcement Learning
 
-[![ARXIV](https://img.shields.io/badge/ARXIV-DeepRefine-b31b1b)]()
+[![ARXIV](https://img.shields.io/badge/ARXIV-DeepRefine-b31b1b)](https://arxiv.org/pdf/2605.10488)
 [![PYTHON](https://img.shields.io/badge/HuggingFace-DeepRefine-yellow.svg)](https://huggingface.co/collections/HaoyuHuang2/deeprefine)
 [![PYTHON](https://img.shields.io/badge/PYTHON-3.10+-blue.svg)](https://python.org)
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
