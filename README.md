@@ -95,3 +95,12 @@ bash scripts/eval/tr_refine_bench_rl.sh
 ```
 
 ## 📖 Citation
+
+```python
+@article{huang2026deeprefine,
+  title={DeepRefine: Agent-Compiled Knowledge Refinement via Reinforcement Learning},
+  author={Huang, Haoyu and Bai, Jiaxin and Liu, Shujie and Wei, Yang and Tsang, Hong Ting and Gao, Yisen and Xie, Zhongwei and Li, Yufei and Song, Yangqiu},
+  journal={arXiv preprint arXiv:2605.10488},
+  year={2026}
+}
+```
