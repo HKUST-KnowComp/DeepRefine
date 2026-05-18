@@ -8,7 +8,7 @@
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
 
 <p align="center">
-    <img src="./assets/icon.png" width="20%" style="max-width: 80;">
+    <img src="./assets/icons.png" width="20%" style="max-width: 80;">
 </p>
 
 🤔 *Your LLM-Wiki Need to be Refined*
