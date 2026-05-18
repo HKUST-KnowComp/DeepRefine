@@ -7,6 +7,10 @@
 [![PYTHON](https://img.shields.io/badge/PYTHON-3.10+-blue.svg)](https://python.org)
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
 
+<p align="center">
+    <img src="./imgs/icon.jpg" width="20%" style="max-width: 80;">
+</p>
+
 🤔 *Your LLM-Wiki Need to be Refined*
 
 <img src="assets/grpo.png" alt="Memory Comparison Chart" width="550">
