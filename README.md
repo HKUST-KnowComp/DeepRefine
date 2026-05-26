@@ -2,18 +2,19 @@
 
 # ***DeepRefine***: Agent-Compiled Knowledge Refinement via Reinforcement Learning
 
+<p align="center">
+    <img src="./assets/icons.png" width="20%" style="max-width: 80;">
+</p>
+
 [![ARXIV](https://img.shields.io/badge/ARXIV-DeepRefine-b31b1b)](https://arxiv.org/pdf/2605.10488)
 [![PYTHON](https://img.shields.io/badge/HuggingFace-DeepRefine-yellow.svg)](https://huggingface.co/collections/HaoyuHuang2/deeprefine)
 [![PYTHON](https://img.shields.io/badge/PYTHON-3.10+-blue.svg)](https://python.org)
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
 
-<p align="center">
-    <img src="./assets/icons.png" width="20%" style="max-width: 80;">
-</p>
-
-🤔 *Your LLM-Wiki Need to be Refined*
 
 <img src="assets/grpo.png" alt="Memory Comparison Chart" width="550">
+
+🤔 *Your LLM-Wiki Need to be Refined*
 
 **DeepRefine** is a general LLM-based reasoning model for agent-compiled knowledge refinement that improves the quality of any pre-constructed knowledge bases with user queries to make it more suitable for the downstream tasks.
 
