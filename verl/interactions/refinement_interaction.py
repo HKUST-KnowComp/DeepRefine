@@ -17,24 +17,14 @@ try:
 except ImportError:
     from autorefiner.src.rag_server.edge_retriever import EdgeRetriever
 
-try:
-    from autograph.rag_server.reafiner_prompt import (
-        REAFINER_JUDGEMENT_SYSTEM_PROMPT,
-        REAFINER_JUDGEMENT_USER_PROMPT,
-        REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,
-        REAFINER_ERROR_ABDUCTION_USER_PROMPT,
-        REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT,
-        REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT,
-    )
-except ImportError:
-    from autorefiner.src.reafiner_prompt import (
-        REAFINER_JUDGEMENT_SYSTEM_PROMPT,
-        REAFINER_JUDGEMENT_USER_PROMPT,
-        REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,
-        REAFINER_ERROR_ABDUCTION_USER_PROMPT,
-        REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT,
-        REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT,
-    )
+from autorefiner.src.rag_server.deeprefine_prompt import (
+    REAFINER_JUDGEMENT_SYSTEM_PROMPT,
+    REAFINER_JUDGEMENT_USER_PROMPT,
+    REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,
+    REAFINER_ERROR_ABDUCTION_USER_PROMPT,
+    REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT,
+    REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

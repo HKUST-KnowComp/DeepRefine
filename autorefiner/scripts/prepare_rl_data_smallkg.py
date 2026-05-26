@@ -21,7 +21,7 @@ from tqdm import tqdm
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-from autograph.rag_server.reafiner_prompt import (
+from autograph.rag_server.deeprefine_prompt import (
     REAFINER_JUDGEMENT_SYSTEM_PROMPT,
     REAFINER_JUDGEMENT_USER_PROMPT,
     REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,

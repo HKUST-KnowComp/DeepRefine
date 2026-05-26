@@ -13,12 +13,12 @@ from typing import Any, Dict, List, Tuple, Optional, Iterable, Set, Callable
 from atlas_rag.retriever.base import BaseEdgeRetriever, BasePassageRetriever
 from atlas_rag.llm_generator import LLMGenerator
 from atlas_rag.vectorstore.embedding_model import BaseEmbeddingModel
-from autograph.rag_server.reafiner_prompt import REAFINER_JUDGEMENT_SYSTEM_PROMPT, REAFINER_JUDGEMENT_USER_PROMPT, \
-    REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT, REAFINER_ERROR_ABDUCTION_USER_PROMPT, \
-    REAFINER_KG_REFINEMENT_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_USER_PROMPT, \
-    REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT, \
-    REAFINER_FILTERING_SYSTEM_PROMPT, REAFINER_FILTERING_USER_PROMPT, \
-    REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT
+from autorefiner.src.rag_server.deeprefine_prompt import REAFINER_JUDGEMENT_SYSTEM_PROMPT, REAFINER_JUDGEMENT_USER_PROMPT, \
+        REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT, REAFINER_ERROR_ABDUCTION_USER_PROMPT, \
+        REAFINER_KG_REFINEMENT_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_USER_PROMPT, \
+        REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT, \
+        REAFINER_FILTERING_SYSTEM_PROMPT, REAFINER_FILTERING_USER_PROMPT, \
+        REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT
 from atlas_rag.retriever.simple_retriever import SimpleGraphRetriever
 from atlas_rag.retriever.hipporag import HippoRAGRetriever
 from atlas_rag.evaluation.evaluation import QAJudger

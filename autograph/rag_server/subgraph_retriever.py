@@ -11,7 +11,7 @@ from autograph.rag_server.reranker_api import Reranker
 from autograph.rag_server.base_retriever import RetrieverConfig, BaseRetriever
 import math
 from autograph.rag_server.tog_prompt import REASONING_PROMPT, ANSWER_GENERATION_PROMPT, FEW_SHOT_EXAMPLE, VERIFY_ANSWER_PROMPT
-from autograph.rag_server.reafiner_prompt import REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT
+from autograph.rag_server.deeprefine_prompt import REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT
 import jellyfish
 import logging 
 
