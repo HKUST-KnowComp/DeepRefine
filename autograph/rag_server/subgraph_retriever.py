@@ -203,9 +203,9 @@ class SubgraphRetriever(BaseRetriever):
             self.answer_gen_fn = self.deduce_answer
         elif self.reward_function == "f1_reward":
             self.answer_gen_fn = self.generate_answer
-        elif self.reward_function == "gbd_f1_reward":
+        elif self.reward_function == "gbd_reward":
             self.answer_gen_fn = self.generate_answer
-        elif self.reward_function not in ['f1_reward', 'deduce_reward', 'gbd_f1_reward']:
+        elif self.reward_function not in ['f1_reward', 'deduce_reward', 'gbd_reward']:
             raise ValueError(f"reward_function {self.reward_function} not supported")
         self.KG = kg
         self.sampling_params = sampling_params
