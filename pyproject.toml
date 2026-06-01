@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verl"
+dynamic = ["version"]
+requires-python = ">=3.10"
+description = "verl (DeepRefine fork): Volcano Engine Reinforcement Learning for LLM"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {file = "verl/version/version"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["verl*"]
+
+[tool.setuptools.package-data]
+verl = [
+  "version/*",
+  "trainer/config/*.yaml",
+  "trainer/config/*/*.yaml",
+]

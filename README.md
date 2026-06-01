@@ -23,7 +23,36 @@
 ## News
 - [2026/5/10] Static quants of DeepRefine-v1-8B, 🤗 [mradermacher/DeepRefine-v1-8B-GGUF](https://huggingface.co/mradermacher/DeepRefine-v1-8B-GGUF) has been released. Thanks to the community!
 
+## 🪜 Environment
 
+We provide a [Dockerfile](./Dockerfile) for a reproducible environment.
+
+### Local setup
+
+**Create `atlastune` from scratch:**
+
+```shell
+cd /path/to/DeepRefine
+conda env create -f docker/atlastune_environment.yml
+conda activate atlastune
+pip install -e .
+```
+
+**Create the environment with pip only:**
+
+```shell
+conda create -n atlastune python=3.10 -y
+conda activate atlastune
+cd /path/to/DeepRefine
+
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+pip install -r docker/requirements-atlastune.txt
+pip install flash-attn==2.8.3 --no-build-isolation
+pip install -e .
+```
+
+`pip install -e .` registers the bundled `verl` package. For local `atlas-rag` development, use `pip install -e ./AutoSchemaKG` instead of the PyPI pin when needed.
 
 ## 📊 Training Data Preprocessing
 
