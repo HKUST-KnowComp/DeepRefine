@@ -54,6 +54,10 @@ pip install -e .
 
 `pip install -e .` registers the bundled `verl` package. For local `atlas-rag` development, use `pip install -e ./AutoSchemaKG` instead of the PyPI pin when needed.
 
+## Quick Start Demo
+
+We have a demo pipline [test.ipynb](./test.ipynb), in which you can have a quick overview about what DeepRefine is doing.
+
 ## 📊 Training Data Preprocessing
 
 We collect the raw training data of HotpotQA from https://hotpotqa.github.io/ and then construct the data samples for RL training through the following script:
