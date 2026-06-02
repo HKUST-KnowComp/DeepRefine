@@ -21,6 +21,7 @@
 </div>
 
 ## News
+- [2026/6/2] ✨[DeepRefine-Skill](https://github.com/HKUST-KnowComp/DeepRefine-Skill) has released! An agent skill to evolve the quality of LLM-Wiki (Graphify) at test time with the harness of DeepRefine.
 - [2026/5/10] Static quants of DeepRefine-v1-8B, 🤗 [mradermacher/DeepRefine-v1-8B-GGUF](https://huggingface.co/mradermacher/DeepRefine-v1-8B-GGUF) has been released. Thanks to the community!
 
 ## 🪜 Environment
@@ -53,6 +54,17 @@ pip install -e .
 ```
 
 `pip install -e .` registers the bundled `verl` package. For local `atlas-rag` development, use `pip install -e ./AutoSchemaKG` instead of the PyPI pin when needed.
+
+### graphify + Cursor skill (DeepRefine-Skill)
+
+The `/deeprefine` Cursor skill and `deeprefine` CLI live in a **separate repo** ([DeepRefine-Skill](../DeepRefine-Skill)), sibling to this one. After `atlastune` is ready:
+
+```shell
+pip install -e /path/to/DeepRefine-Skill
+cd /path/to/your-kb-project && deeprefine cursor install
+```
+
+See [DeepRefine-Skill/README.md](../DeepRefine-Skill/README.md) for the full graphify workflow.
 
 ## 🚀 Quick Start Demo
 
