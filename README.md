@@ -3,7 +3,7 @@
 # ***DeepRefine***: Agent-Compiled Knowledge Refinement via Reinforcement Learning
 
 <p align="center">
-    <img src="./assets/icons2.png" width="20%" style="max-width: 80;">
+    <img src="./assets/icons3.png" width="20%" style="max-width: 80;">
 </p>
 
 [![ARXIV](https://img.shields.io/badge/ARXIV-DeepRefine-b31b1b)](https://arxiv.org/pdf/2605.10488)
