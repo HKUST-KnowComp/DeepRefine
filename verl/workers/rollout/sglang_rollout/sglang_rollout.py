@@ -101,13 +101,13 @@ import configparser
 from openai import AsyncOpenAI
 from enum import Enum
 import json
-from autograph.rag_server.base_retriever import RetrieverConfig
-from autograph.rag_server.reranker_api import Reranker
-from autograph.rag_server.llm_api import LLMGenerator
+from autorefiner.src.rag_server.base_retriever import RetrieverConfig
+from autorefiner.src.rag_server.reranker_api import Reranker
+from autorefiner.src.rag_server.llm_api import LLMGenerator
 import json_repair
 import networkx as nx
 import pickle
-# from autograph.rag_server.rag_server import *
+# from autorefiner.src.rag_server.rag_server import *
 
 class AutoGraphStateEnum(Enum):
     CONSTRUCTING = "constructing"
@@ -1521,7 +1521,7 @@ class SGLangRollout(BaseRollout):
                     initial_kg = inst.get("kg")
                     question = _req.interaction_kwargs.get("question", "")
                     if initial_kg is not None and question:
-                        from autograph.rag_server.subgraph_retriever import SubgraphRetriever
+                        from autorefiner.src.rag_server.subgraph_retriever import SubgraphRetriever
 
                         api_sampling_params = {
                             "max_new_tokens": min(
@@ -2134,7 +2134,7 @@ class SGLangRollout(BaseRollout):
             question = _req.interaction_kwargs.get("question", "")
             refined_kg = _req.interaction_kwargs.get("refined_kg_data")
 
-            from autograph.rag_server.subgraph_retriever import SubgraphRetriever
+            from autorefiner.src.rag_server.subgraph_retriever import SubgraphRetriever
 
             if refined_kg is None:
                 output_text = "Error: No refined KG found"
@@ -2205,7 +2205,7 @@ class SGLangRollout(BaseRollout):
                     has_error = True
                 
                 if not has_error:
-                    from autograph.rag_server.subgraph_retriever import SubgraphRetriever
+                    from autorefiner.src.rag_server.subgraph_retriever import SubgraphRetriever
                     retriever = SubgraphRetriever(self.retriever_config, self.gen_acc_judge_generator, self.reranker,
                                                 set_llm_judge_model=self.set_llm_judge_model, llm_judge_generator=self.llm_judge_generator)
                     num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
@@ -2237,7 +2237,7 @@ class SGLangRollout(BaseRollout):
                     has_error = True
                 
                 if not has_error:
-                    from autograph.rag_server.tog_v3 import TogV3Retriever
+                    from autorefiner.src.rag_server.tog_v3 import TogV3Retriever
                     retriever = TogV3Retriever(self.retriever_config, self.gen_acc_judge_generator, self.reranker)
                     num_hop = len(_req.interaction_kwargs.get('supporting_context', []))
                     if num_hop == 0:
@@ -2264,7 +2264,7 @@ class SGLangRollout(BaseRollout):
                     has_error = True
                 
                 if not has_error:
-                    from autograph.rag_server.edge_retriever import EdgeRetriever
+                    from autorefiner.src.rag_server.edge_retriever import EdgeRetriever
                     retriever = EdgeRetriever(self.retriever_config, self.gen_acc_judge_generator, self.reranker)
                     answer = await retriever.retrieve(
                         question=question,
@@ -2288,10 +2288,10 @@ class SGLangRollout(BaseRollout):
                     has_error = True
                 if not has_error:
                     if self.rag_method == "hipporag":
-                        from autograph.rag_server.hipporag1 import HippoRAGRetriever
+                        from autorefiner.src.rag_server.hipporag1 import HippoRAGRetriever
                         retriever = HippoRAGRetriever(self.retriever_config, self.gen_acc_judge_generator, self.reranker)
                     elif self.rag_method == "hipporag2":
-                        from autograph.rag_server.hipporag2 import HippoRAG2Retriever
+                        from autorefiner.src.rag_server.hipporag2 import HippoRAG2Retriever
                         retriever = HippoRAG2Retriever(self.retriever_config, self.gen_acc_judge_generator, self.reranker)
                     else:
                         raise ValueError("Invalid rag_method for text_linking")
