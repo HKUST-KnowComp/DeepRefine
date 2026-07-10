@@ -1,0 +1,11 @@
+# Keep image lean while shipping code + data needed to run
+.git
+.gitignore
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+wandb/
+.cursor/
+.vscode/
+*.swp
+.DS_Store
