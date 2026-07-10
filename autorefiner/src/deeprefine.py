@@ -69,7 +69,7 @@ class RefinementResult:
     refinement_action_raw: str
 
 
-class Reafiner:
+class DeepRefine:
     """
     - Minimal / K-hop Retrieve: Retrieve a subgraph from KG based on text vector index (support multi-hop iteration expansion).
     - Answerable Judgement: Judge if the current subgraph is enough to answer the query.
@@ -1296,4 +1296,4 @@ class Reafiner:
         return subgraph
 
 
-__all__ = ["Reafiner", "RetrievalStepResult", "RefinementResult"]
+__all__ = ["DeepRefine", "RetrievalStepResult", "RefinementResult"]

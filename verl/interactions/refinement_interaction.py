@@ -73,7 +73,7 @@ class RefinementInteraction(BaseInteraction):
         self.increment_hop = config.get("increment_hop", 1)
         self.max_triple_num = config.get("max_triple_num", 90)
         # Per judgement-round triple budget: hop 0 == base_top_k, then +40 each hop up to max_triple_num.
-        # Mirrors Reafiner(..., max_triple_num_by_step=[10, 50, 90], max_hops=3).
+        # Mirrors DeepRefine(..., max_triple_num_by_step=[10, 50, 90], max_hops=3).
         step_caps = config.get("max_triple_num_by_step")
         if step_caps is not None:
             self.max_triple_num_by_step = [int(x) for x in step_caps]
@@ -338,7 +338,7 @@ class RefinementInteraction(BaseInteraction):
             prev_steps = sum(1 for h in inst["interaction_history"] if h.get("phase") == "judgement")
             judgement_steps = prev_steps + 1
 
-            # Record structured interaction history, similar to reafiner.Reafiner
+            # Record structured interaction history, similar to deeprefine.DeepRefine
             inst["interaction_history"].append(
                 {
                     "phase": "judgement",
@@ -360,7 +360,7 @@ class RefinementInteraction(BaseInteraction):
                     return True, "No need to do any refinement.", 1.0, {}
                 else:
                     inst["refinement_phase"] = "abduction"
-                    # Build interaction history string in the same style as reafiner.py
+                    # Build interaction history string in the same style as deeprefine.py
                     history = inst["interaction_history"]
                     horizon = getattr(self, "history_horizon_size", 0) or 0
                     if horizon > 0 and len(history) > horizon:
@@ -784,7 +784,7 @@ class RefinementInteraction(BaseInteraction):
     def _construct_subgraph(
         kg: DiGraph, node_list: List, initial_nodes: List, num_hop: int = 1
     ) -> DiGraph:
-        """Construct a multi-hop subgraph around initial nodes (BFS). Same logic as reafiner.Reafiner._construct_subgraph."""
+        """Construct a multi-hop subgraph around initial nodes (BFS). Same logic as deeprefine.DeepRefine._construct_subgraph."""
         subgraph = DiGraph()
         visited = set()
         node_set = set(node_list)

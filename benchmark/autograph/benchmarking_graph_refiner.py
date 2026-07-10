@@ -21,7 +21,7 @@ import asyncio
 from dataclasses import asdict
 from tqdm import tqdm
 sys.path.append('../../')
-from autorefiner.src.reafiner import Reafiner, RetrievalStepResult
+from autorefiner.src.deeprefine import DeepRefine, RetrievalStepResult
 
 
 def _refinement_result_to_jsonable(
@@ -193,7 +193,7 @@ async def main():
                     with open(f"{output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl", "rb") as f:
                         data = pickle.load(f)
                 else:
-                    reafiner = Reafiner(
+                    deeprefine = DeepRefine(
                         data=data,
                         sentence_encoder=sentence_encoder,
                         llm_generator=reafiner_llm_generator,
@@ -210,7 +210,7 @@ async def main():
                         query_data = query_data[:1000]
                     # -------- Coverage-based subset selection (方案A, with 1-hop sampling) --------
                     print(f"[Selecting refine subset]")
-                    selected_queries, subset_stats = reafiner.select_refine_subset(
+                    selected_queries, subset_stats = deeprefine.select_refine_subset(
                         query_data=query_data,
                         max_subset_size=args.refine_max_subset_size,
                         target_coverage=args.refine_subset_target_coverage,
@@ -233,7 +233,7 @@ async def main():
                     with open(refinement_log_path, "w", encoding="utf-8") as refinement_log_f:
                         for sample in tqdm(selected_queries, desc="Refining KG (selected subset)"):
                             query = sample["question"]
-                            final_answer, refined_kg_data, refinement_result = reafiner.refine(query=query)
+                            final_answer, refined_kg_data, refinement_result = deeprefine.refine(query=query)
                             record = _refinement_result_to_jsonable(
                                 sample, final_answer, refinement_result
                             )
@@ -241,33 +241,33 @@ async def main():
                                 json.dumps(record, ensure_ascii=False) + "\n"
                             )
                             refinement_log_f.flush()
-                            print(f"Refined KG: {reafiner.kg}")
+                            print(f"Refined KG: {deeprefine.kg}")
                             n_steps = (
                                 len(refinement_result.interaction_history)
                                 if refinement_result is not None
                                 else 0
                             )
                             print(f"\033[94m [Total Steps: {n_steps}] \033[0m")
-                    data = reafiner.data
+                    data = deeprefine.data
                     # TODO: add the passage node to the KG
-                    text_id_list = list(reafiner.text_id_to_node_name.keys())
+                    text_id_list = list(deeprefine.text_id_to_node_name.keys())
                     for text_id in text_id_list:
-                        reafiner.kg.add_node(
+                        deeprefine.kg.add_node(
                             text_id,
                             file_id=text_id,
-                            id=reafiner._safe_sanitize(reafiner.text_id_to_node_name[text_id]),
+                            id=deeprefine._safe_sanitize(deeprefine.text_id_to_node_name[text_id]),
                             type="passage"
                         )
-                    for node_id in list(reafiner.node_list):
-                        if reafiner.node_id_to_file_id[node_id] is not None:
-                            reafiner.kg.add_edge(
+                    for node_id in list(deeprefine.node_list):
+                        if deeprefine.node_id_to_file_id[node_id] is not None:
+                            deeprefine.kg.add_edge(
                                 node_id,
-                                reafiner.node_id_to_file_id[node_id],
+                                deeprefine.node_id_to_file_id[node_id],
                                 relation="mention in",
                                 type="Source"
                             )
-                    print(f"Refined KG (w/ passage nodes): {reafiner.kg}")
-                    data['KG'] = reafiner.kg
+                    print(f"Refined KG (w/ passage nodes): {deeprefine.kg}")
+                    data['KG'] = deeprefine.kg
                 # save the data file for repeatedly using
                 # Use pickle to save complex objects (NetworkX graph, FAISS indices, numpy arrays)
                 if args.refine:
