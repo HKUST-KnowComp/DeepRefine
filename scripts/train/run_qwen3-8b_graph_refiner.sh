@@ -3,45 +3,18 @@
 # export CUDA devices
 #!/bin/bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export NCCL_P2P_DISABLE=1
-export NCCL_IB_DISABLE=1
-export CUDA_LAUNCH_BLOCKING=0
-# export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HYDRA_FULL_ERROR=1
+export HF_HUB_OFFLINE=0
 
-export GLOO_SOCKET_IFNAME=eth0
-export NCCL_SOCKET_IFNAME=eth0
-export TORCH_DISTRIBUTED_DEBUG=INFO
-export NCCL_DEBUG=INFO
-export GLOO_TIMEOUT_SECONDS=43200
-export TORCH_DISTRIBUTED_TIMEOUT=43200
-export NCCL_TIMEOUT=43200
-export GLOO_TIMEOUT=43200
-export TORCH_DISTRIBUTED_DEFAULT_TIMEOUT=43200
-export NCCL_IB_TIMEOUT=43200
-export TORCH_DISTRIBUTED_GLOO_TIMEOUT=43200
+: "${CHECKPOINT_ROOT:=/workspace/checkpoints}"
+: "${HF_HOME:=/workspace/.cache/huggingface}"
+: "${RAY_TMPDIR:=/tmp/ray}"
+: "${TRANSFORMERS_CACHE:=/workspace/.cache/transformers}"
 
-export SWANLAB_LOG_DIR=/path_to_your_ray_tmp/swanlog
-export WANDB_DIR=/path_to_your_ray_tmp/wandb
-export WANDB_CACHE_DIR=/path_to_your_ray_tmp/wandb
-export WANDB_CONFIG_DIR=/path_to_your_ray_tmp/wandb
-export WANDB_DATA_DIR=/path_to_your_ray_tmp/wandb
-export WANDB_ARTIFACT_DIR=/path_to_your_ray_tmp/wandb
-export HF_DATASETS_CACHE=/path_to_your_ray_tmp/
-
-: "${DATA_ROOT:=/path_to_your_data}"
-: "${CHECKPOINT_ROOT:=/path_to_your_checkpoints/checkpoints}"
-: "${HF_HOME:=/path_to_your_models/models}"
-: "${RAY_TMPDIR:=/path_to_your_ray_tmp}"
-: "${TRANSFORMERS_CACHE:=/path_to_your_models/models}"
-: "${MODEL_ROOT:=/path_to_your_models/models}"
-
-export DATA_ROOT
 export CHECKPOINT_ROOT
 export HF_HOME
 export RAY_TMPDIR
 export TRANSFORMERS_CACHE
-export MODEL_ROOT
 
 mkdir -p "$RAY_TMPDIR"
 
@@ -53,8 +26,8 @@ set -x
 
 ulimit -n 65535
 
-CONFIG_PATH="/path_to_your_config/config"
-
+PROJECT_DIR="$(pwd)"
+CONFIG_PATH="$PROJECT_DIR/config"
 TEXT_LINKING="False" # available: True, False
 F1_REWARD="False" # available: True, False
 F1_GBD_REWARD="True" # available: True, False
@@ -69,8 +42,8 @@ GROUP_SIZE=6
 LR=1e-7
 
 
-TRAIN_DATA="path_to_your_data/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
-VAL_DATA="path_to_your_data/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+TRAIN_DATA="$PROJECT_DIR/data/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+VAL_DATA="$PROJECT_DIR/data/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
 MAX_ASSISTANT_TURN=6
 MAX_USER_TURN=6
 
@@ -80,7 +53,7 @@ reward_fn_file_path="verl/third_party/autograph_r1/gbd_reward.py"
 reward_function="gbd_reward"
 
 EXPERIMENT_NAME="Qwen3-8B-refinement-rl-gbd_reward-hotpotqa-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
-CHECKPOINT_DIR="path_to_your_checkpoints/checkpoints/${EXPERIMENT_NAME}"
+CHECKPOINT_DIR="${CHECKPOINT_ROOT:-/workspace/checkpoints}/${EXPERIMENT_NAME}"
 
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
@@ -137,7 +110,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='auto_graph_rl' \
+    trainer.project_name='deeprefine' \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
