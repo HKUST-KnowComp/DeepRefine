@@ -2,14 +2,20 @@
 # make sure your current working directory is the root of the project
 # export CUDA devices
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_P2P_DISABLE=1
-export CUDA_LAUNCH_BLOCKING=0
-# export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export HYDRA_FULL_ERROR=1
 export HF_HUB_OFFLINE=0
-export HF_HOME=/path_to_your_models/models
-export RAY_TMPDIR=/path_to_your_ray_tmp
+
+: "${CHECKPOINT_ROOT:=/workspace/checkpoints}"
+: "${HF_HOME:=/workspace/.cache/huggingface}"
+: "${RAY_TMPDIR:=/tmp/ray}"
+: "${TRANSFORMERS_CACHE:=/workspace/.cache/transformers}"
+
+export CHECKPOINT_ROOT
+export HF_HOME
+export RAY_TMPDIR
+export TRANSFORMERS_CACHE
+
 mkdir -p "$RAY_TMPDIR"
 
 WANDB_API_KEY=""
@@ -34,8 +40,8 @@ MINI_BATCH_SIZE=16
 GROUP_SIZE=6
 LR=5e-7
 
-TRAIN_DATA="path_to_your_data/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
-VAL_DATA="path_to_your_data/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+TRAIN_DATA="$PROJECT_DIR/data/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+VAL_DATA="$PROJECT_DIR/data/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
 MAX_ASSISTANT_TURN=6
 MAX_USER_TURN=6
 
@@ -44,8 +50,8 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 reward_fn_file_path="verl/third_party/autograph_r1/gbd_reward.py"
 reward_function="gbd_reward"
 
-EXPERIMENT_NAME="Qwen3-4B-refinement-rl-gbd_reward-hotpotqa-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
-CHECKPOINT_DIR="path_to_your_checkpoints/checkpoints/${EXPERIMENT_NAME}"
+EXPERIMENT_NAME="exp-Qwen3-4B-deeprefine-gbd_reward-hotpotqa-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
+CHECKPOINT_DIR="${CHECKPOINT_ROOT:-$PROJECT_DIR/checkpoints}/${EXPERIMENT_NAME}"
 
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
@@ -99,9 +105,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='auto_graph_rl' \
+    trainer.project_name='deeprefine' \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.total_training_steps=200 \
     trainer.save_freq=10 \
