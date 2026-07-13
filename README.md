@@ -21,12 +21,17 @@
 </div>
 
 ## News
+- [2026/7/14] We have released our docker image 🚢[DeepRefine](https://hub.docker.com/r/hhyhuang/deeprefine). Feel free to use it to train the model directly!
 - [2026/6/2] ✨[DeepRefine-Skill](https://github.com/HKUST-KnowComp/DeepRefine-Skill) has released! An agent skill to evolve the quality of LLM-Wiki (Graphify) at test time with the harness of DeepRefine.
 - [2026/5/10] Static quants of DeepRefine-v1-8B, 🤗 [mradermacher/DeepRefine-v1-8B-GGUF](https://huggingface.co/mradermacher/DeepRefine-v1-8B-GGUF) has been released. Thanks to the community!
 
 ## 🪜 Environment
 
-We provide a [Dockerfile](./Dockerfile) for a reproducible environment.
+We provide a [Dockerfile](./Dockerfile) for a reproducible environment. You can also pull the prebuilt image directly:
+
+```shell
+docker pull hhyhuang/deeprefine
+```
 
 ### Local setup
 
