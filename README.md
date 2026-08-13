@@ -12,7 +12,7 @@
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
 
 
-<img src="assets/grpo.png" alt="Memory Comparison Chart" width="550">
+<img src="assets/grpo.png" alt="training pipeline" width="500">
 
 🤔 *Your LLM-Wiki Need to be Refined*
 
