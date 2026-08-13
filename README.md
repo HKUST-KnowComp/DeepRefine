@@ -12,7 +12,7 @@
 [![LICENSE](https://img.shields.io/badge/LICENSE-MIT-orange.svg)](LICENSE)
 
 
-<img src="assets/training.png" alt="training pipeline" width="500">
+<img src="assets/training_pip.png" alt="training pipeline" width="500">
 
 🤔 *Your LLM-Wiki Need to be Refined*
 
