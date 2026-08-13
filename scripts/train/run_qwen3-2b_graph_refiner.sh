@@ -1,10 +1,13 @@
+# run on 2xA100
+# make sure your current working directory is the root of the project
+# export CUDA devices
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-# export NCCL_P2P_DISABLE=1
-# export CUDA_LAUNCH_BLOCKING=0
-# export CUDA_DEVICE_MAX_CONNECTIONS=1
-# export HYDRA_FULL_ERROR=1
-# export HF_HUB_OFFLINE=0
+export CUDA_VISIBLE_DEVICES=3,4
+export NCCL_P2P_DISABLE=1
+export CUDA_LAUNCH_BLOCKING=0
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export HYDRA_FULL_ERROR=1
+export HF_HUB_OFFLINE=0
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray}"
 mkdir -p "$RAY_TMPDIR"
@@ -21,57 +24,54 @@ ulimit -n 65535
 
 PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/config"
+
+# parameters
+DOC_SIZE=15 # available: 8,12,15
 TEXT_LINKING="False" # available: True, False
-F1_REWARD="False" # available: True, False
-F1_GBD_REWARD="True" # available: True, False
-MIX_DATA="True" # available: True, False
-DEDUCE_REWARD="False"
 ITERATIVE="True"
 REFINEMTN="True"    # False for AR1
 BATCH_SIZE=64
-MICRO_BATCH_SIZE=4
-MINI_BATCH_SIZE=32
+MICRO_BATCH_SIZE=1
+MINI_BATCH_SIZE=16
 GROUP_SIZE=16
 LR=1e-6
 
-# Prefer GRPO-variance curated train set (draft_wrong + learnable gain variance).
-TRAIN_DATA="$PROJECT_DIR/data/hotpotqa_train_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
+TRAIN_DATA="$PROJECT_DIR/data/hotpopqa_dev_all.parquet"
 VAL_DATA="$PROJECT_DIR/data/hotpotqa_valid_refinement_gbd_smallkg_chunk_genacc_5000.parquet"
-MAX_ASSISTANT_TURN=10
-MAX_USER_TURN=10
+MAX_ASSISTANT_TURN=6
+MAX_USER_TURN=6
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-reward_fn_file_path="verl/third_party/autograph_r1/gbd_f1_reward.py"
-reward_function="gbd_f1_reward"
+reward_fn_file_path="verl/third_party/autograph_r1/gbd_reward.py"
+reward_function="gbd_reward"
 
-EXPERIMENT_NAME="Qwen3-8B-refinement-rl-gbd_f1_reward-subgraphrag-grpo-curated-hotpotqa-kl-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
-CHECKPOINT_DIR="${CHECKPOINT_ROOT:-/workspace/checkpoints}/${EXPERIMENT_NAME}"
+EXPERIMENT_NAME="exp-Qwen3-1.7B-deeprefine-gbd_reward-cr-hotpotqa-${BATCH_SIZE}-${GROUP_SIZE}-${MINI_BATCH_SIZE}-${MICRO_BATCH_SIZE}-${LR}"
+CHECKPOINT_DIR="${CHECKPOINT_ROOT:-$PROJECT_DIR/checkpoints}/${EXPERIMENT_NAME}"
 
 python3 -m verl.trainer.main_ppo \
     --config-path="$CONFIG_PATH" \
     --config-name='autograph_multiturn_grpo' \
     algorithm.adv_estimator=grpo \
-    algorithm.use_kl_in_reward=False \
+    algorithm.use_kl_in_reward=True \
     data.train_batch_size=$BATCH_SIZE \
     data.val_batch_size=$BATCH_SIZE \
-    data.max_prompt_length=4096 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.shuffle=True \
     data.truncation='middle' \
     data.return_raw_chat=True \
-    data.apply_chat_template_kwargs.enable_thinking=False \
-    actor_rollout_ref.model.path=Qwen/Qwen3-8B \
+    actor_rollout_ref.model.path=Qwen/Qwen3-1.7B \
     actor_rollout_ref.actor.optim.lr=$LR \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.02 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$MINI_BATCH_SIZE \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=1e-4 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=1e-3 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -79,18 +79,17 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.autograph_mode='autorefine' \
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    actor_rollout_ref.rollout.max_model_len=8192 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_model_len=16384 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=sglang \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=$GROUP_SIZE \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$MAX_ASSISTANT_TURN \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURN \
     actor_rollout_ref.rollout.multi_turn.tokenization_sanity_check_mode=disable \
     actor_rollout_ref.rollout.multi_turn.interaction_config_path='config/interaction_config/refinement_interaction_config.yaml' \
     actor_rollout_ref.rollout.multi_turn.use_inference_chat_template=True \
-    actor_rollout_ref.rollout.multi_turn.chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.strategy=fsdp2 \
     actor_rollout_ref.actor.strategy=fsdp2 \
@@ -99,13 +98,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gen_acc_judge_model="$GEN_ACC_JUDGE_MODEL" \
     critic.strategy=fsdp2 \
     reward_model.strategy=fsdp2 \
-    actor_rollout_ref.nccl_timeout=7200 \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='deeprefine' \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.total_training_steps=200 \
     trainer.save_freq=10 \
@@ -117,14 +115,14 @@ python3 -m verl.trainer.main_ppo \
     custom_reward_function.path="$reward_fn_file_path" \
     actor_rollout_ref.rollout._target_=verl.third_party.autograph_r1.autograph_config.AutoGraphActorConfig \
     actor_rollout_ref.rollout.use_api=True \
-    actor_rollout_ref.rollout.rag_method='re_subgraph' \
+    actor_rollout_ref.rollout.rag_method='re_edge' \
     actor_rollout_ref.rollout.text_linking=$TEXT_LINKING \
     actor_rollout_ref.rollout.freeze_answer_api=True \
     actor_rollout_ref.rollout.iterative=$ITERATIVE \
     actor_rollout_ref.rollout.tight=False \
     actor_rollout_ref.rollout.reward_function=$reward_function \
     actor_rollout_ref.rollout.set_llm_judge_model=True \
-    actor_rollout_ref.rollout.reranker_model_name='Qwen/Qwen3-Embedding-0.6B' \
+    actor_rollout_ref.rollout.reranker_model_name='Qwen/Qwen3-Embedding-0.6B-batch' \
     actor_rollout_ref.rollout.llm_judge_model_name='Qwen/Qwen2.5-7B-Instruct' \
     actor_rollout_ref.rollout.skip_tokenizer_init=False \
     custom_reward_function.reward_kwargs.triple_repetition_penalty=0.0 \
