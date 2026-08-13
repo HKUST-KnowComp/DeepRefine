@@ -4,9 +4,9 @@ interaction:
     config:
       config_path: "verl/third_party/autograph_r1/config.ini"
       base_top_k: 10
-      max_hops: 3
-      max_triple_num: 90
-      max_triple_num_by_step: [10, 50, 90]
+      max_hops: 4
+      max_triple_num: 130
+      max_triple_num_by_step: [10, 50, 90, 130]
       history_horizon_size: 3
   - name: "graph_construction"
     class_name: "verl.interactions.rag_interaction.RAGInteraction"

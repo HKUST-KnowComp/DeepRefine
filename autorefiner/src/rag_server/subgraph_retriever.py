@@ -198,14 +198,14 @@ class SubgraphRetriever(BaseRetriever):
         """
         self.sub_queries = kwargs.get("sub_queries", [])
         self.answer = kwargs.get("answer", "unknown")
-        self.reward_function = kwargs.get("reward_function", None)
+        self.reward_function = kwargs.get("reward_function", "gbd_reward")
         if self.reward_function == "deduce_reward":
             self.answer_gen_fn = self.deduce_answer
         elif self.reward_function == "f1_reward":
             self.answer_gen_fn = self.generate_answer
-        elif self.reward_function == "gbd_reward":
+        elif self.reward_function == "gbd_reward" or self.reward_function == "gbd_f1_reward":
             self.answer_gen_fn = self.generate_answer
-        elif self.reward_function not in ['f1_reward', 'deduce_reward', 'gbd_reward']:
+        elif self.reward_function not in ['f1_reward', 'deduce_reward', 'gbd_reward', 'gbd_f1_reward']:
             raise ValueError(f"reward_function {self.reward_function} not supported")
         self.KG = kg
         self.sampling_params = sampling_params

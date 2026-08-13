@@ -107,6 +107,9 @@ class AsyncRolloutRequest(BaseModel):
     loss_mask: Optional[torch.Tensor] = None
     prompt_loss_mask: Optional[torch.Tensor] = None
     response_loss_mask: Optional[torch.Tensor] = None
+    generation_mask: Optional[torch.Tensor] = None
+    prompt_generation_mask: Optional[torch.Tensor] = None
+    response_generation_mask: Optional[torch.Tensor] = None
     reward_scores: dict[str, float]
     max_prompt_len: int
     max_response_len: int = 8192
@@ -204,6 +207,9 @@ class AsyncRolloutRequest(BaseModel):
 
         values["prompt_ids"], values["prompt_attention_mask"] = values["input_ids"], values["attention_mask"]
         values["loss_mask"] = values["prompt_loss_mask"] = torch.zeros_like(values["input_ids"], dtype=torch.bool)
+        values["generation_mask"] = values["prompt_generation_mask"] = torch.zeros_like(
+            values["input_ids"], dtype=torch.bool
+        )
         values["generation_prompt_ids"] = values["input_ids"][..., tokens_without_prompt.shape[-1] :]
         values["base_conv_wo_gen_prompt_end_pos"] = cls._handle_apply_chat_template(
             processing_class,
@@ -327,6 +333,7 @@ class AsyncRolloutRequest(BaseModel):
         new_input_ids: torch.Tensor,
         attention_mask: bool,
         loss_mask: bool,
+        generation_mask: bool = False,
         new_multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         """
@@ -337,6 +344,8 @@ class AsyncRolloutRequest(BaseModel):
         self.attention_mask = torch.cat([self.attention_mask, attention_mask], dim=-1)
         loss_mask = torch.ones_like(new_input_ids) * int(loss_mask)
         self.loss_mask = torch.cat([self.loss_mask, loss_mask], dim=-1)
+        generation_mask = torch.ones_like(new_input_ids) * int(generation_mask)
+        self.generation_mask = torch.cat([self.generation_mask, generation_mask], dim=-1)
 
         if new_multi_modal_inputs:
             self._update_multi_modal_inputs(new_multi_modal_inputs)
@@ -355,8 +364,10 @@ class AsyncRolloutRequest(BaseModel):
             == self.attention_mask.shape[-1]
             == self.position_ids.shape[-1]
             == self.loss_mask.shape[-1]
+            == self.generation_mask.shape[-1]
         ), f"""Request {self.request_id} has different length of {self.input_ids.shape[-1]=}, 
-            {self.attention_mask.shape[-1]=}, {self.position_ids.shape[-1]=}, {self.loss_mask.shape[-1]=}"""
+            {self.attention_mask.shape[-1]=}, {self.position_ids.shape[-1]=},
+            {self.loss_mask.shape[-1]=}, {self.generation_mask.shape[-1]=}"""
 
     def _update_multi_modal_inputs(self, new_multi_modal_inputs: dict[str, torch.Tensor]) -> None:
         """
@@ -368,6 +379,72 @@ class AsyncRolloutRequest(BaseModel):
                 torch.cat([self.multi_modal_inputs[key], input_tensor], dim=0)
                 if key in self.multi_modal_inputs
                 else input_tensor
+            )
+
+    def rebuild_initial_prompt(
+        self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
+    ) -> None:
+        """Retokenize the initial request after an interaction rewrites its prompt."""
+        messages = [message.model_dump(exclude_none=True) for message in self.messages]
+        tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
+        device = self.input_ids.device if self.input_ids is not None else None
+
+        tokens_without_generation_prompt = self._handle_apply_chat_template(
+            processing_class,
+            messages,
+            multi_modal_data=self.multi_modal_data,
+            tools=tools,
+            add_generation_prompt=False,
+            tokenize=True,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+        tokenized = self._handle_apply_chat_template(
+            processing_class,
+            messages,
+            multi_modal_data=self.multi_modal_data,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+        input_ids = tokenized.pop("input_ids")
+        attention_mask = tokenized.pop("attention_mask")
+        if device is not None:
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            tokenized = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in tokenized.items()
+            }
+
+        position_ids = self._get_position_ids(
+            processing_class, input_ids, attention_mask, tokenized
+        )
+        loss_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        self.input_ids = self.prompt_ids = input_ids
+        self.attention_mask = self.prompt_attention_mask = attention_mask
+        self.position_ids = self.prompt_position_ids = position_ids
+        self.loss_mask = self.prompt_loss_mask = loss_mask
+        self.generation_mask = self.prompt_generation_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        self.multi_modal_inputs = tokenized
+        self.generation_prompt_ids = input_ids[..., tokens_without_generation_prompt.shape[-1] :]
+
+        self.response_ids = None
+        self.response_attention_mask = None
+        self.response_position_ids = None
+        self.response_loss_mask = None
+        self.response_generation_mask = None
+        self.output_token_ids = None
+        self.rollout_log_probs = None
+
+        if input_ids.shape[-1] > self.max_prompt_len:
+            logger.warning(
+                "Prompt %s has length %d after interaction rewrite, exceeding max_prompt_len %d.",
+                self.batch_data_id,
+                input_ids.shape[-1],
+                self.max_prompt_len,
             )
 
     def get_generation_prompt_ids(
@@ -437,7 +514,13 @@ class AsyncRolloutRequest(BaseModel):
                 processing_class, messages, multi_modal_data={}, tools=tools, add_generation_prompt=False, tokenize=True,
                 chat_template_kwargs=self.chat_template_kwargs,
             )[..., self.base_conv_with_gen_prompt_end_pos :]
-        self._update_input_ids(processing_class, content_ids, attention_mask=True, loss_mask=True)
+        self._update_input_ids(
+            processing_class,
+            content_ids,
+            attention_mask=True,    # the token can be seen as usefull context
+            loss_mask=True,         # be used for loss calculation
+            generation_mask=True,   # counted for total generated tokens
+        )
         
     def add_assistant_message_without_loss(
         self,
@@ -457,7 +540,13 @@ class AsyncRolloutRequest(BaseModel):
                 processing_class, messages, multi_modal_data={}, tools=tools, add_generation_prompt=False, tokenize=True,
                 chat_template_kwargs=self.chat_template_kwargs,
             )[..., self.base_conv_with_gen_prompt_end_pos :]
-        self._update_input_ids(processing_class, content_ids, attention_mask=True, loss_mask=False)
+        self._update_input_ids(
+            processing_class,
+            content_ids,
+            attention_mask=True,
+            loss_mask=False,
+            generation_mask=True,
+        )
         
     def add_system_message(
         self,
@@ -610,6 +699,7 @@ class AsyncRolloutRequest(BaseModel):
             self.attention_mask = self.attention_mask[..., : -self.generation_prompt_ids.shape[-1]]
             self.position_ids = self.position_ids[..., : -self.generation_prompt_ids.shape[-1]]
             self.loss_mask = self.loss_mask[..., : -self.generation_prompt_ids.shape[-1]]
+            self.generation_mask = self.generation_mask[..., : -self.generation_prompt_ids.shape[-1]]
 
     def finalize(
         self,
@@ -715,8 +805,10 @@ class AsyncRolloutRequest(BaseModel):
             == self.attention_mask.shape[-1]
             == self.position_ids.shape[-1]
             == self.loss_mask.shape[-1]
+            == self.generation_mask.shape[-1]
         ), f"""Request {self.request_id} has different length of {self.input_ids.shape[-1]=}, 
-            {self.attention_mask.shape[-1]=}, {self.position_ids.shape[-1]=}, {self.loss_mask.shape[-1]=}"""
+            {self.attention_mask.shape[-1]=}, {self.position_ids.shape[-1]=},
+            {self.loss_mask.shape[-1]=}, {self.generation_mask.shape[-1]=}"""
 
     def truncate_output_ids(
         self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
@@ -725,6 +817,7 @@ class AsyncRolloutRequest(BaseModel):
         self.attention_mask = self.attention_mask[..., : self.max_model_len]
         self.position_ids = self.position_ids[..., : self.max_model_len]
         self.loss_mask = self.loss_mask[..., : self.max_model_len]
+        self.generation_mask = self.generation_mask[..., : self.max_model_len]
         self.response_ids = self.input_ids[..., self.prompt_ids.shape[-1] :][..., : self.max_response_len]
         self.response_attention_mask = self.attention_mask[..., self.prompt_attention_mask.shape[-1] :][
             ..., : self.max_response_len
@@ -733,3 +826,6 @@ class AsyncRolloutRequest(BaseModel):
             ..., : self.max_response_len
         ]
         self.response_loss_mask = self.loss_mask[..., self.prompt_loss_mask.shape[-1] :][..., : self.max_response_len]
+        self.response_generation_mask = self.generation_mask[..., self.prompt_generation_mask.shape[-1] :][
+            ..., : self.max_response_len
+        ]

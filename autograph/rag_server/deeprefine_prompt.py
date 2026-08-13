@@ -40,6 +40,12 @@ Question: {question}
 Knowledge Graph (KG) context: {triples_string}
 """
 
+REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT = """Additional Knowledge Graph (KG) context:
+{triples_string}
+
+Using the original question and all KG context in this conversation, judge answerability again.
+Output only <judge>Yes</judge> or <judge>No</judge>."""
+
 REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT = """
 As an advanced error abduction assistant, your task is to analyze the error reasons based on the given interaction history.
 
@@ -52,6 +58,10 @@ Analyze the reasons of the unanswerable questions based on the given interaction
 REAFINER_ERROR_ABDUCTION_USER_PROMPT = """
 Interaction history: {interaction_history}
 """
+
+REAFINER_ABDUCTION_USER_PROMPT = """The KG expansion stage is complete.
+Using the original question, all KG context, and judgement results already present in this conversation,
+analyze why the question was initially unanswerable."""
 
 REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT = """
 As an advanced knowledge graph refinement assistant, your task is to generate a series of actions (**within 10 actions**) to refine the given KG to make it more suitable for answering the given question.
@@ -74,6 +84,12 @@ KG: {triples_string}
 Question: {question}
 Error reasons: {error_reasons}
 """
+
+REAFINER_ACTION_USER_PROMPT = """Original Text:
+{original_text}
+
+Using the original question, accumulated KG context, and the abduction immediately above,
+generate the graph refinement actions."""
 
 REAFINER_KG_REFINEMENT_SYSTEM_PROMPT = """
 As an advanced knowledge graph refinement assistant, your task is to refine knowledge graph to make it more suitable for answering the given question.

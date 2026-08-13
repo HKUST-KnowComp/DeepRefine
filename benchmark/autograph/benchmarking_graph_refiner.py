@@ -20,7 +20,7 @@ import pickle
 import asyncio
 from dataclasses import asdict
 from tqdm import tqdm
-sys.path.append('../../')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from autorefiner.src.deeprefine import DeepRefine, RetrievalStepResult
 
 
@@ -92,7 +92,28 @@ argparser.add_argument(
         "Default: False. Unsupported template kwargs are only retried without them on HTTP 400, never on 429."
     ),
 )
+argparser.add_argument(
+    "--force_refine",
+    action="store_true",
+    help="Ignore existing refined_kg_*.pkl and re-run refinement from the base KG.",
+)
+argparser.add_argument(
+    "--require_query_overlap",
+    action="store_true",
+    help="Only apply inserts where subject or object overlaps the question text.",
+)
+argparser.add_argument(
+    "--max_refine_actions",
+    type=int,
+    default=5,
+    help="Cap applied refinement actions per query (default 5 for less KG pollution).",
+)
 args = argparser.parse_args()
+
+
+def _original_chunk_from_sample(sample: dict):
+    """Build action-prompt source text from the sample's full context."""
+    return sample.get("context") or sample.get("paragraphs") or sample.get("original_chunk")
 
 
 def _llm_default_config() -> GenerationConfig:
@@ -101,23 +122,61 @@ def _llm_default_config() -> GenerationConfig:
     cfg.chat_template_kwargs = {"enable_thinking": args.llm_enable_thinking}
     return cfg
 
-kg_names = ["2wikimultihopqa", "musique", "hotpotqa", "2021wiki", "locomo"]
+kg_names = ["locomo"]
+
+def _resolve_hf_snapshot_dir(repo_id: str) -> str:
+    """Resolve local HuggingFace snapshot dir for ``repo_id`` (e.g. Qwen/Qwen3-8B).
+
+    Tries the default hub cache first, then common local cache roots used on this
+    machine (``HF_HUB_CACHE`` / ``HF_HOME`` / ``/data1/.../models/hub``).
+    """
+    from huggingface_hub import constants, snapshot_download
+
+    cache_candidates = []
+    for c in (
+        os.environ.get("HUGGINGFACE_HUB_CACHE"),
+        os.environ.get("HF_HUB_CACHE"),
+        os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME") else None,
+        getattr(constants, "HF_HUB_CACHE", None),
+        "/data1/hjingaa/models/hub",
+        "/data1/hjingaa/models",
+        "/data1/hjingaa/.cache/hub",
+        os.path.expanduser("~/.cache/huggingface/hub"),
+    ):
+        if c and c not in cache_candidates:
+            cache_candidates.append(c)
+
+    errors = []
+    for cache_dir in cache_candidates:
+        try:
+            return snapshot_download(
+                repo_id=repo_id,
+                local_files_only=True,
+                cache_dir=cache_dir,
+            )
+        except Exception as e:
+            errors.append(f"{cache_dir}: {e}")
+    raise FileNotFoundError(
+        f"Cannot resolve local HF snapshot for {repo_id}. Tried:\n  "
+        + "\n  ".join(errors)
+    )
+
 
 async def main():
     for kg_name in kg_names:
         # Load SentenceTransformer model
         encoder_model_name = "Qwen/Qwen3-Embedding-0.6B"
         sentence_model = OpenAI(
-            base_url="http://0.0.0.0:8128/v1",
+            base_url="http://127.0.0.1:8128/v1",
             api_key="EMPTY KEY",
         )
         sentence_encoder = Qwen3Emb(sentence_model)
 
-        if "checkpoints" not in args.reafiner_model_name:
+        if "huggingface" not in args.reafiner_model_name:
             # freeze model vllm
             reafiner_model_name = args.reafiner_model_name
             reafiner_client = OpenAI(
-                base_url="http://0.0.0.0:8132/v1",
+                base_url="http://127.0.0.1:8134/v1",
                 api_key="EMPTY KEY",
             )
             reafiner_llm_generator = LLMGenerator(
@@ -129,7 +188,7 @@ async def main():
             # RL trained model vllm
             reafiner_model_name = args.reafiner_model_name
             reafiner_client = OpenAI(
-                base_url="http://0.0.0.0:8132/v1",
+                base_url="http://127.0.0.1:8133/v1",
                 api_key="EMPTY KEY",
             )
             reafiner_llm_generator = LLMGenerator(
@@ -140,7 +199,7 @@ async def main():
 
         reader_model_name = args.reader_model_name
         reader_client = OpenAI(
-            base_url="http://0.0.0.0:8129/v1",
+            base_url="http://127.0.0.1:8129/v1",
             api_key="EMPTY KEY",
         )
         reader_llm_generator = LLMGenerator(
@@ -150,14 +209,21 @@ async def main():
         )
         
         # save under the reafiner model name dict
-        if "checkpoints" not in args.reafiner_model_name:
-            if reafiner_model_name == "qwen3-8b":
-                if args.kg_type == "naive":
-                    output_directory = f'/data/haoyuhuang/model/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/constructed_kg_naive/{kg_name}_output'
-                elif args.kg_type == "ar1":
-                    output_directory = f'/data/haoyuhuang/model/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/constructed_kg_ar1/{kg_name}_output'
-                elif args.kg_type == "graphify":
-                    output_directory = f'/data/haoyuhuang/model/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/constructed_kg_graphify/{kg_name}_output'
+        if "huggingface" not in args.reafiner_model_name:
+            # Base model: resolve HuggingFace default local snapshot for Qwen/Qwen3-8B
+            # (supports both short name "qwen3-8b" and hub id "Qwen/Qwen3-8B").
+            if reafiner_model_name in ("qwen3-8b", "Qwen/Qwen3-8B", "Qwen3-8B"):
+                model_root = _resolve_hf_snapshot_dir("Qwen/Qwen3-8B")
+                output_directory = (
+                    f"{model_root}/constructed_kg_{args.kg_type}/{kg_name}_output"
+                )
+                print(f"\033[94m HF snapshot for Qwen/Qwen3-8B: {model_root} \033[0m")
+                print(f"\033[94m KG output_directory: {output_directory} \033[0m")
+            else:
+                raise ValueError(
+                    f"Unsupported reafiner_model_name for non-RL path: {reafiner_model_name}. "
+                    "Expected qwen3-8b / Qwen/Qwen3-8B, or a local .../huggingface RL checkpoint."
+                )
         else:
             if args.kg_type == "naive":
                 output_directory = f'{reafiner_model_name}/constructed_kg_naive/{kg_name}_output'
@@ -188,23 +254,63 @@ async def main():
         for qa_name in qa_names:
             # refine the KG
             if args.refine:
-                if os.path.exists(f"{output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl"):
-                    print(f"\033[94m Found refined KG in {output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl \033[0m")
-                    with open(f"{output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl", "rb") as f:
+                model_tag = reafiner_model_name.replace("/", "_")
+                # 2021wiki is shared by nq/popqa; keep a separate refined KG per QA set.
+                if kg_name == "2021wiki":
+                    refined_kg_path = (
+                        f"{output_directory}/refined_kg_{model_tag}_{qa_name}.pkl"
+                    )
+                else:
+                    refined_kg_path = (
+                        f"{output_directory}/refined_kg_{model_tag}.pkl"
+                    )
+                if args.force_refine and os.path.exists(refined_kg_path):
+                    os.remove(refined_kg_path)
+                    print(f"\033[93m [--force_refine] removed {refined_kg_path} \033[0m")
+                if os.path.exists(refined_kg_path):
+                    print(f"\033[94m Found refined KG in {refined_kg_path} \033[0m")
+                    with open(refined_kg_path, "rb") as f:
                         data = pickle.load(f)
                 else:
+                    # For 2021wiki, reload base KG so popqa does not refine on top of nq.
+                    if kg_name == "2021wiki" and not args.use_upperbound:
+                        data = create_embeddings_and_index(
+                            sentence_encoder=sentence_encoder,
+                            model_name=encoder_model_name,
+                            working_directory=output_directory,
+                            keyword=kg_name,
+                            include_concept=False,
+                            include_events=False,
+                            normalize_embeddings=False,
+                            text_batch_size=256,
+                            node_and_edge_batch_size=256,
+                            use_flat_index=True,
+                        )
+                    # True multi-turn aligned with training RefinementInteraction
+                    # (config/interaction_config/refinement_interaction_config.yaml):
+                    # Judgement×N (caps [10,50,90]) → Abduction → Action on one chat history.
+                    # Offline tricks: original_chunk + grounded/conflict filters.
                     deeprefine = DeepRefine(
                         data=data,
                         sentence_encoder=sentence_encoder,
                         llm_generator=reafiner_llm_generator,
                         base_top_k=10,
-                        max_hops=4,
-                        max_triple_num=70,
-                        max_triple_num_by_step=[10, 30, 50, 70],
-                        history_horizon_size=4,
+                        max_hops=3,
+                        max_triple_num=50,
+                        # max_triple_num_by_step=[10, 50, 90],
+                        max_triple_num_by_step=[10, 30, 50],
+                        history_horizon_size=3,
                         if_gen_answer=False,
+                        ground_inserts=False,
+                        ground_mode="off",
+                        require_query_overlap=False,
+                        skip_generic_objects=False,
+                        skip_conflict_inserts=False,
+                        skip_action_if_answerable=False,
+                        max_actions=args.max_refine_actions,
+                        max_format_retry=2,
                     )
-                    question_file=f"../{qa_name}.json"
+                    question_file=f"benchmark/{qa_name}.json"
                     with open(question_file, "r") as f:
                         query_data = json.load(f)
                         query_data = query_data[:1000]
@@ -222,6 +328,13 @@ async def main():
                         f"\033[94m Selected {len(selected_queries)} / {len(query_data)} queries "
                         f"(coverage={subset_stats['covered']}/{subset_stats['universe']}={subset_stats['coverage_ratio']:.3f}) \033[0m"
                     )
+                    print(
+                        f"\033[94m Refine tricks: ground_mode={deeprefine.ground_mode}, "
+                        f"query_overlap={deeprefine.require_query_overlap}, "
+                        f"skip_conflict={deeprefine.skip_conflict_inserts}, "
+                        f"skip_if_answerable={deeprefine.skip_action_if_answerable}, "
+                        f"max_actions={deeprefine.max_actions} \033[0m"
+                    )
 
                     refinement_log_path = os.path.join(
                         output_directory,
@@ -233,7 +346,12 @@ async def main():
                     with open(refinement_log_path, "w", encoding="utf-8") as refinement_log_f:
                         for sample in tqdm(selected_queries, desc="Refining KG (selected subset)"):
                             query = sample["question"]
-                            final_answer, refined_kg_data, refinement_result = deeprefine.refine(query=query)
+                            # Training-aligned: pass sample context as original_chunk
+                            original_chunk = _original_chunk_from_sample(sample)
+                            final_answer, refined_kg_data, refinement_result = deeprefine.refine(
+                                query=query,
+                                original_chunk=original_chunk,
+                            )
                             record = _refinement_result_to_jsonable(
                                 sample, final_answer, refinement_result
                             )
@@ -247,7 +365,15 @@ async def main():
                                 if refinement_result is not None
                                 else 0
                             )
-                            print(f"\033[94m [Total Steps: {n_steps}] \033[0m")
+                            n_actions = (
+                                len(refinement_result.refinement_action_list)
+                                if refinement_result is not None
+                                and refinement_result.refinement_action_list is not None
+                                else 0
+                            )
+                            print(
+                                f"\033[94m [Total Steps: {n_steps}] [Applied actions: {n_actions}] \033[0m"
+                            )
                     data = deeprefine.data
                     # TODO: add the passage node to the KG
                     text_id_list = list(deeprefine.text_id_to_node_name.keys())
@@ -271,9 +397,9 @@ async def main():
                 # save the data file for repeatedly using
                 # Use pickle to save complex objects (NetworkX graph, FAISS indices, numpy arrays)
                 if args.refine:
-                    with open(f"{output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl", "wb") as f:
+                    with open(refined_kg_path, "wb") as f:
                         pickle.dump(data, f)
-                    print(f"Refined KG data saved to {output_directory}/refined_kg_{reafiner_model_name.replace('/', '_')}.pkl")
+                    print(f"Refined KG data saved to {refined_kg_path}")
 
             inference_config = InferenceConfig(keyword=qa_name)
             # get the parent directory of output_directory
@@ -284,7 +410,7 @@ async def main():
                 base_dir = base_dir + "_dense"
             benchmark_config = BenchMarkConfig(
                 dataset_name=qa_name,
-                question_file=f"../{qa_name}.json",
+                question_file=f"benchmark/{qa_name}.json",
                 result_dir=f"{base_dir}/benchmark/graph_retrieval",
                 include_concept=False,
                 include_events=False,
@@ -335,7 +461,7 @@ async def main():
                 # Start benchmarking (retrievers 顺序，query 并发)
                 benchmark = RAGBenchmark(config=benchmark_config, logger=logger)
                 await benchmark.run_async([tog_retriever, subgraph_retriever],
-                                          llm_generator=reader_llm_generator, max_concurrency=32)
+                                          llm_generator=reader_llm_generator, max_concurrency=64)
 
 if __name__ == "__main__":
     asyncio.run(main())

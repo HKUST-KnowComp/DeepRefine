@@ -143,7 +143,7 @@ class HippoRAGRetriever(BaseRetriever):
         self.KG = kg
         top_n_passages = kwargs.get("top_n_passages", self.config.topN_passages)
         self.reward_function = kwargs.get("reward_function", None)
-        if self.reward_function not in ['f1_reward', 'recall_reward']:
+        if self.reward_function not in ['f1_reward', 'recall_reward', 'gbd_reward', 'gbd_f1_reward']:
             raise ValueError(f"reward_function {self.reward_function} not supported")
 
         for node, attrs in kg.nodes(data=True):
@@ -198,7 +198,7 @@ class HippoRAGRetriever(BaseRetriever):
         precision = await self.calculate_precision_reward(sorted_passages, self.supporting_context)
         recall = await self.calculate_recall_reward(sorted_passages, self.supporting_context)
         # generate answer
-        if self.reward_function == 'f1_reward':
+        if self.reward_function in ['f1_reward', 'gbd_reward']:
             context = "\n".join(sorted_passages)
             prompt = ANSWER_GENERATION_PROMPT
             messages = [

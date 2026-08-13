@@ -20,16 +20,18 @@ except ImportError:
 from autorefiner.src.rag_server.deeprefine_prompt import (
     REAFINER_JUDGEMENT_SYSTEM_PROMPT,
     REAFINER_JUDGEMENT_USER_PROMPT,
+    REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT,
     REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,
-    REAFINER_ERROR_ABDUCTION_USER_PROMPT,
+    REAFINER_ABDUCTION_USER_PROMPT,
     REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT,
-    REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT,
+    REAFINER_ACTION_USER_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _ILLEGAL_XML_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 _FORMAT_RETRY_PROMPT = (
     "Your previous output could not be parsed. "
@@ -48,7 +50,7 @@ _FORMAT_RETRY_PROMPT = (
 
 
 def _format_original_chunk_for_action_prompt(original_chunk: Any) -> str:
-    """Text for REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT `original_text` (from data interaction_kwargs)."""
+    """Normalize source text from data interaction_kwargs for the action prompt."""
     if original_chunk is None:
         return ""
     if isinstance(original_chunk, str):
@@ -97,6 +99,20 @@ class RefinementInteraction(BaseInteraction):
         idx = min(judgement_steps, len(self.max_triple_num_by_step) - 1)
         return min(self.max_triple_num_by_step[idx], self.max_triple_num)
 
+    @staticmethod
+    def _expanded_judgement_prompt(inst: Dict[str, Any], previous_context: set[str]) -> str:
+        added_context = [
+            triple for triple in inst.get("sorted_context", []) if triple not in previous_context
+        ]
+        triples_string = "\n".join(added_context) if added_context else "(no new triples)"
+        return REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT.format(triples_string=triples_string)
+
+    @staticmethod
+    def _action_user_prompt(inst: Dict[str, Any]) -> str:
+        return REAFINER_ACTION_USER_PROMPT.format(
+            original_text=_format_original_chunk_for_action_prompt(inst.get("original_chunk"))
+        )
+
     def _prune_working_kg_and_context(
         self,
         kg_full: DiGraph,
@@ -106,12 +122,12 @@ class RefinementInteraction(BaseInteraction):
         max_items: int,
     ) -> Tuple[DiGraph, List[str], Dict[str, Any]]:
         """Keep full KG in *kg_full*; build working *kg* and *sorted_context* with at most *max_items* triples."""
-        subgraph_triples = sorted(
-            [
-                (kg_full.nodes[u].get("id", u), d.get("relation", ""), kg_full.nodes[v].get("id", v))
-                for u, v, d in kg_full.edges(data=True)
-            ]
-        )
+        subgraph_triples = []
+        for u, v, d in kg_full.edges(data=True):
+            named = self._named_triple_from_nodes(kg_full, u, v, d.get("relation", ""))
+            if named is not None:
+                subgraph_triples.append(named)
+        subgraph_triples = sorted(subgraph_triples)
         # No embedding sort/prune when already within budget (saves encoder calls).
         if max_items <= 0 or len(subgraph_triples) <= max_items:
             selected = subgraph_triples
@@ -122,8 +138,22 @@ class RefinementInteraction(BaseInteraction):
                 sentence_encoder=sentence_encoder,
                 max_items=max_items,
             )
+        return self._build_working_kg_and_context(selected, entity_to_id, kg_full=kg_full)
+
+    def _build_working_kg_and_context(
+        self,
+        triples: List[Tuple[str, str, str]],
+        entity_to_id: Dict[str, str],
+        kg_full: Optional[DiGraph] = None,
+    ) -> Tuple[DiGraph, List[str], Dict[str, Any]]:
         kg = DiGraph()
-        for s, r, o in selected:
+        cleaned_triples: List[Tuple[str, str, str]] = []
+        for s, r, o in triples:
+            named = self._sanitize_named_triple(s, r, o, kg=kg_full, entity_to_id=entity_to_id)
+            if named is None:
+                continue
+            cleaned_triples.append(named)
+        for s, r, o in cleaned_triples:
             sid = self._get_node_id(s, entity_to_id)
             oid = self._get_node_id(o, entity_to_id)
             if sid not in kg.nodes:
@@ -132,9 +162,100 @@ class RefinementInteraction(BaseInteraction):
                 kg.add_node(oid, id=o, type="entity")
             if not kg.has_edge(sid, oid):
                 kg.add_edge(sid, oid, relation=r)
-        node_id_to_attr_id = {kg.nodes[n].get("id", str(n)): n for n in kg.nodes}
-        sorted_context = [f"{s}  {r}  {o}" for s, r, o in selected]
+        node_id_to_attr_id = {
+            str(kg.nodes[n].get("id")): n
+            for n in kg.nodes
+            if kg.nodes[n].get("id") is not None
+            and not self._looks_like_internal_id(kg.nodes[n].get("id"))
+        }
+        sorted_context = [f"{s}  {r}  {o}" for s, r, o in cleaned_triples]
         return kg, sorted_context, node_id_to_attr_id
+
+    def _expand_working_kg(
+        self,
+        inst: Dict[str, Any],
+        cap: int,
+    ) -> bool:
+        """Preserve current triples, then add local and global candidates up to cap."""
+        kg_full = inst.get("kg_full")
+        current: List[Tuple[str, str, str]] = []
+        for triple_str in inst.get("sorted_context") or []:
+            parts = str(triple_str).split("  ", 2)
+            if len(parts) != 3:
+                continue
+            named = self._sanitize_named_triple(
+                parts[0].strip(),
+                parts[1].strip(),
+                parts[2].strip(),
+                kg=kg_full,
+                entity_to_id=inst.get("entity_to_id"),
+            )
+            if named is not None:
+                current.append(named)
+
+        if kg_full is None or not current or len(current) >= cap:
+            return False
+
+        id_to_node = {
+            str(kg_full.nodes[n].get("id", "")): n
+            for n in kg_full.nodes()
+            if kg_full.nodes[n].get("id") is not None
+            and not self._looks_like_internal_id(kg_full.nodes[n].get("id"))
+        }
+        for n in kg_full.nodes():
+            id_to_node.setdefault(str(n), n)
+
+        initial_nodes = {
+            id_to_node[entity]
+            for s, _, o in current
+            for entity in (s, o)
+            if entity in id_to_node
+        }
+        local_triples: List[Tuple[str, str, str]] = []
+        if initial_nodes:
+            local_graph = self._construct_subgraph(
+                kg_full,
+                list(kg_full.nodes()),
+                list(initial_nodes),
+                num_hop=self.increment_hop,
+            )
+            for u, v, d in local_graph.edges(data=True):
+                named = self._named_triple_from_nodes(
+                    kg_full, u, v, d.get("relation", "")
+                )
+                if named is not None:
+                    local_triples.append(named)
+
+        global_triples = []
+        for u, v, d in kg_full.edges(data=True):
+            named = self._named_triple_from_nodes(kg_full, u, v, d.get("relation", ""))
+            if named is not None:
+                global_triples.append(named)
+
+        selected = list(dict.fromkeys(current))
+        selected_set = set(selected)
+        for candidates in (local_triples, global_triples):
+            remaining = cap - len(selected)
+            if remaining <= 0:
+                break
+            unseen = [triple for triple in candidates if triple not in selected_set]
+            ranked = self._rank_triples_by_query_similarity(
+                unseen,
+                inst.get("question") or "",
+                inst.get("sentence_encoder"),
+                remaining,
+            )
+            selected.extend(ranked)
+            selected_set.update(ranked)
+
+        if len(selected) == len(current):
+            return False
+        inst["kg"], inst["sorted_context"], inst["node_id_to_attr_id"] = (
+            self._build_working_kg_and_context(
+                selected, inst["entity_to_id"], kg_full=kg_full
+            )
+        )
+        return True
 
     async def start_interaction(
         self,
@@ -253,6 +374,11 @@ class RefinementInteraction(BaseInteraction):
                 o = self._safe_sanitize(t.get("object", ""))
                 if not s or not o:
                     continue
+                if self._looks_like_internal_id(s) or self._looks_like_internal_id(o):
+                    logger.warning(
+                        "Drop draft triple with internal hash entity: %s | %s | %s", s, r, o
+                    )
+                    continue
                 sid = self._get_node_id(s, entity_to_id)
                 oid = self._get_node_id(o, entity_to_id)
                 if sid not in kg.nodes:
@@ -266,6 +392,22 @@ class RefinementInteraction(BaseInteraction):
             kg, sorted_context, node_id_to_attr_id = self._prune_working_kg_and_context(
                 kg_full, entity_to_id, question, sentence_encoder, cap0
             )
+            # The rollout request is initialized with the full KG prompt from the
+            # dataset. Keep its first judgement prompt consistent with the pruned
+            # working KG; otherwise the model sees the full graph even though the
+            # configured first-round cap is much smaller.
+            triples_string = "\n".join(sorted_context) if sorted_context else "(no triples)"
+            prompt_judgement_user = REAFINER_JUDGEMENT_USER_PROMPT.format(
+                question=question or "", triples_string=triples_string
+            )
+            for msg in reversed(initial_messages):
+                if isinstance(msg, dict):
+                    if msg.get("role") == "user":
+                        msg["content"] = prompt_judgement_user
+                        break
+                elif getattr(msg, "role", "") == "user":
+                    msg.content = prompt_judgement_user
+                    break
         else:
             # No per-sample KG: we currently require every request to carry its own KG
             # (e.g., via draft_kg or prompt-injected triples). This keeps behavior explicit
@@ -360,97 +502,26 @@ class RefinementInteraction(BaseInteraction):
                     return True, "No need to do any refinement.", 1.0, {}
                 else:
                     inst["refinement_phase"] = "abduction"
-                    # Build interaction history string in the same style as deeprefine.py
-                    history = inst["interaction_history"]
-                    horizon = getattr(self, "history_horizon_size", 0) or 0
-                    if horizon > 0 and len(history) > horizon:
-                        used_history = history[:-horizon]
-                    else:
-                        used_history = history
-                    hist_str = "\n".join(
-                        [
-                            "Step{}:\n['Query': {}, 'Subgraph_hop': {}, 'Subgraph_content': {}, 'Answerable': {}]\n".format(
-                                i + 1,
-                                h.get("query", ""),
-                                h.get("subgraph_hop", ""),
-                                str(h.get("subgraph_content", "")),
-                                h.get("answerable", ""),
-                            )
-                            for i, h in enumerate(used_history)
-                        ]
-                    )
-                    next_system = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
-                    next_user = REAFINER_ERROR_ABDUCTION_USER_PROMPT.format(interaction_history=hist_str)
-                    extra["next_system"] = next_system
+                    extra["next_system"] = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
                     extra["next_rag_state"] = "abduction"
-                    return False, next_user, 1.0, extra
+                    return False, REAFINER_ABDUCTION_USER_PROMPT, 1.0, extra
 
             # Not answerable: keep doing answerable_judgement up to max_hops.
-            # 即使这一轮没法扩张子图，也继续用当前子图再判一轮，而不是立刻进 abduction。
             if judgement_steps < self.max_hops:
-                # Expand on the per-instance full KG (query-specific). Do NOT share KG across requests.
-                kg_orig = inst.get("kg_full")
-                if kg_orig is not None:
-                    node_list = list(kg_orig.nodes())
-                    sorted_ctx = inst.get("sorted_context") or []
-                    node_str_list: List[str] = []
-                    for triple_str in sorted_ctx:
-                        parts = triple_str.split("  ", 2)
-                        if len(parts) == 3:
-                            node_str_list.append(parts[0].strip())
-                            node_str_list.append(parts[2].strip())
-                    node_str_list = list(set(node_str_list))
-                    id_to_node = {kg_orig.nodes[n].get("id", n): n for n in kg_orig.nodes()}
-                    initial_nodes = [id_to_node[ns] for ns in node_str_list if ns in id_to_node]
-                    if initial_nodes:
-                        subgraph = self._construct_subgraph(
-                            kg_orig, node_list, initial_nodes, num_hop=self.increment_hop
-                        )
-                        cap = self._triple_cap_for_expansion(judgement_steps)
-                        inst["kg"], sorted_context, inst["node_id_to_attr_id"] = (
-                            self._prune_working_kg_and_context(
-                                copy.deepcopy(subgraph),
-                                inst["entity_to_id"],
-                                inst.get("question"),
-                                inst.get("sentence_encoder"),
-                                cap,
-                            )
-                        )
-                        inst["sorted_context"] = sorted_context
-                        triples_string = "\n".join(sorted_context) if sorted_context else "(no triples)"
-                        inst["prompt_judgement_user"] = REAFINER_JUDGEMENT_USER_PROMPT.format(
-                            question=inst["question"], triples_string=triples_string
-                        )
-                # 无论本轮是否成功扩张子图，只要还没到 max_hops，就继续下一轮 judgement
-                extra["next_system"] = inst["prompt_judgement_system"]
-                extra["next_rag_state"] = "answerable_judgement"
-                return False, inst["prompt_judgement_user"], 1.0, extra
-
-            # 达到 max_hops 才进入 abduction
-            inst["refinement_phase"] = "abduction"
-            history = inst["interaction_history"]
-            horizon = getattr(self, "history_horizon_size", 0) or 0
-            if horizon > 0 and len(history) > horizon:
-                used_history = history[:-horizon]
-            else:
-                used_history = history
-            hist_str = "\n".join(
-                [
-                    "Step{}:\n['Query': {}, 'Subgraph_hop': {}, 'Subgraph_content': {}, 'Answerable': {}]\n".format(
-                        i + 1,
-                        h.get("query", ""),
-                        h.get("subgraph_hop", ""),
-                        str(h.get("subgraph_content", "")),
-                        h.get("answerable", ""),
+                previous_context = set(inst.get("sorted_context") or [])
+                cap = self._triple_cap_for_expansion(judgement_steps)
+                if self._expand_working_kg(inst, cap):
+                    inst["prompt_judgement_user"] = self._expanded_judgement_prompt(
+                        inst, previous_context
                     )
-                    for i, h in enumerate(used_history)
-                ]
-            )
-            next_system = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
-            next_user = REAFINER_ERROR_ABDUCTION_USER_PROMPT.format(interaction_history=hist_str)
-            extra["next_system"] = next_system
+                    extra["next_system"] = inst["prompt_judgement_system"]
+                    extra["next_rag_state"] = "answerable_judgement"
+                    return False, inst["prompt_judgement_user"], 1.0, extra
+
+            inst["refinement_phase"] = "abduction"
+            extra["next_system"] = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
             extra["next_rag_state"] = "abduction"
-            return False, next_user, 1.0, extra
+            return False, REAFINER_ABDUCTION_USER_PROMPT, 1.0, extra
 
         if current_phase == "abduction":
             print(f"\033[94m [instance {instance_id}] [Abduction] \033[0m")
@@ -469,17 +540,9 @@ class RefinementInteraction(BaseInteraction):
             error_reason = abduction_match.group(1).strip()
             inst["error_abduction_reason"] = error_reason
             inst["refinement_phase"] = "action_generation"
-            triples_string = "\n".join(inst["sorted_context"]) if inst.get("sorted_context") else ""
-            next_system = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
-            next_user = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
-                original_text=_format_original_chunk_for_action_prompt(inst.get("original_chunk")),
-                triples_string=triples_string,
-                question=inst["question"],
-                error_reasons=error_reason,
-            )
-            extra["next_system"] = next_system
+            extra["next_system"] = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
             extra["next_rag_state"] = "action_generation"
-            return False, next_user, 1.0, extra
+            return False, self._action_user_prompt(inst), 1.0, extra
 
         if current_phase == "action_generation":
             print(f"\033[94m [instance {instance_id}] [Action Generation] \033[0m")
@@ -509,7 +572,7 @@ class RefinementInteraction(BaseInteraction):
                         f"\033[93m [instance {instance_id}] "
                         f"[Format retry {inst['format_retry_count']}/{self.max_format_retry}] \033[0m"
                     )
-                    extra["next_system"] = inst["prompt_judgement_system"]
+                    extra["next_system"] = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
                     extra["next_rag_state"] = "action_generation"
                     extra["format_error"] = True
                     return False, _FORMAT_RETRY_PROMPT, 0.0, extra
@@ -606,94 +669,26 @@ class RefinementInteraction(BaseInteraction):
                     return False, "No refinement required. Proceed to graph-based RAG on the current KG.", 1.0, extra
                 else:
                     inst["refinement_phase"] = "abduction"
-                    history = inst["interaction_history"]
-                    horizon = getattr(self, "history_horizon_size", 0) or 0
-                    if horizon > 0 and len(history) > horizon:
-                        used_history = history[:-horizon]
-                    else:
-                        used_history = history
-                    hist_str = "\n".join(
-                        [
-                            "Step{}:\n['Query': {}, 'Subgraph_hop': {}, 'Subgraph_content': {}, 'Answerable': {}]\n".format(
-                                i + 1,
-                                h.get("query", ""),
-                                h.get("subgraph_hop", ""),
-                                str(h.get("subgraph_content", "")),
-                                h.get("answerable", ""),
-                            )
-                            for i, h in enumerate(used_history)
-                        ]
-                    )
-                    next_system = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
-                    next_user = REAFINER_ERROR_ABDUCTION_USER_PROMPT.format(interaction_history=hist_str)
-                    extra["next_system"] = next_system
+                    extra["next_system"] = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
                     extra["next_rag_state"] = "abduction"
-                    return False, next_user, 1.0, extra
+                    return False, REAFINER_ABDUCTION_USER_PROMPT, 1.0, extra
 
             # Not answerable: keep doing answerable_judgement up to max_hops.
             if judgement_steps < self.max_hops:
-                # Expand on the per-instance full KG (query-specific). Do NOT share KG across requests.
-                kg_orig = inst.get("kg_full")
-                if kg_orig is not None:
-                    node_list = list(kg_orig.nodes())
-                    sorted_ctx = inst.get("sorted_context") or []
-                    node_str_list: List[str] = []
-                    for triple_str in sorted_ctx:
-                        parts = triple_str.split("  ", 2)
-                        if len(parts) == 3:
-                            node_str_list.append(parts[0].strip())
-                            node_str_list.append(parts[2].strip())
-                    node_str_list = list(set(node_str_list))
-                    id_to_node = {kg_orig.nodes[n].get("id", n): n for n in kg_orig.nodes()}
-                    initial_nodes = [id_to_node[ns] for ns in node_str_list if ns in id_to_node]
-                    if initial_nodes:
-                        subgraph = self._construct_subgraph(
-                            kg_orig, node_list, initial_nodes, num_hop=self.increment_hop
-                        )
-                        cap = self._triple_cap_for_expansion(judgement_steps)
-                        inst["kg"], sorted_context, inst["node_id_to_attr_id"] = (
-                            self._prune_working_kg_and_context(
-                                copy.deepcopy(subgraph),
-                                inst["entity_to_id"],
-                                inst.get("question"),
-                                inst.get("sentence_encoder"),
-                                cap,
-                            )
-                        )
-                        inst["sorted_context"] = sorted_context
-                        triples_string = "\n".join(sorted_context) if sorted_context else "(no triples)"
-                        inst["prompt_judgement_user"] = REAFINER_JUDGEMENT_USER_PROMPT.format(
-                            question=inst["question"], triples_string=triples_string
-                        )
-                extra["next_system"] = inst["prompt_judgement_system"]
-                extra["next_rag_state"] = "answerable_judgement"
-                return False, inst["prompt_judgement_user"], 1.0, extra
-
-            # 达到 max_hops 才进入 abduction
-            inst["refinement_phase"] = "abduction"
-            history = inst["interaction_history"]
-            horizon = getattr(self, "history_horizon_size", 0) or 0
-            if horizon > 0 and len(history) > horizon:
-                used_history = history[:-horizon]
-            else:
-                used_history = history
-            hist_str = "\n".join(
-                [
-                    "Step{}:\n['Query': {}, 'Subgraph_hop': {}, 'Subgraph_content': {}, 'Answerable': {}]\n".format(
-                        i + 1,
-                        h.get("query", ""),
-                        h.get("subgraph_hop", ""),
-                        str(h.get("subgraph_content", "")),
-                        h.get("answerable", ""),
+                previous_context = set(inst.get("sorted_context") or [])
+                cap = self._triple_cap_for_expansion(judgement_steps)
+                if self._expand_working_kg(inst, cap):
+                    inst["prompt_judgement_user"] = self._expanded_judgement_prompt(
+                        inst, previous_context
                     )
-                    for i, h in enumerate(used_history)
-                ]
-            )
-            next_system = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
-            next_user = REAFINER_ERROR_ABDUCTION_USER_PROMPT.format(interaction_history=hist_str)
-            extra["next_system"] = next_system
+                    extra["next_system"] = inst["prompt_judgement_system"]
+                    extra["next_rag_state"] = "answerable_judgement"
+                    return False, inst["prompt_judgement_user"], 1.0, extra
+
+            inst["refinement_phase"] = "abduction"
+            extra["next_system"] = REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT
             extra["next_rag_state"] = "abduction"
-            return False, next_user, 1.0, extra
+            return False, REAFINER_ABDUCTION_USER_PROMPT, 1.0, extra
 
         if current_phase == "abduction":
             print(f"\033[94m [instance {instance_id}] [Abduction-simple] \033[0m")
@@ -709,17 +704,9 @@ class RefinementInteraction(BaseInteraction):
 
             inst["error_abduction_reason"] = error_reason
             inst["refinement_phase"] = "action_generation"
-            triples_string = "\n".join(inst["sorted_context"]) if inst.get("sorted_context") else ""
-            next_system = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
-            next_user = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
-                original_text=_format_original_chunk_for_action_prompt(inst.get("original_chunk")),
-                triples_string=triples_string,
-                question=inst["question"],
-                error_reasons=error_reason,
-            )
-            extra["next_system"] = next_system
+            extra["next_system"] = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
             extra["next_rag_state"] = "action_generation"
-            return False, next_user, 1.0, extra
+            return False, self._action_user_prompt(inst), 1.0, extra
 
         if current_phase == "action_generation":
             print(f"\033[94m [instance {instance_id}] [Action Generation-simple] \033[0m")
@@ -755,7 +742,7 @@ class RefinementInteraction(BaseInteraction):
                         f"\033[93m [instance {instance_id}] "
                         f"[Format retry {inst['format_retry_count']}/{self.max_format_retry}] \033[0m"
                     )
-                    extra["next_system"] = inst["prompt_judgement_system"]
+                    extra["next_system"] = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
                     extra["next_rag_state"] = "action_generation"
                     extra["format_error"] = True
                     return False, _FORMAT_RETRY_PROMPT, 0.0, extra
@@ -850,6 +837,76 @@ class RefinementInteraction(BaseInteraction):
             return subgraph_triples[:max_items]
 
     @staticmethod
+    def _looks_like_internal_id(value: Any) -> bool:
+        if value is None:
+            return False
+        s = str(value).strip()
+        return bool(_SHA256_HEX_RE.match(s))
+
+    @classmethod
+    def _node_display_name(cls, kg: Optional[DiGraph], node_key: Any) -> str:
+        if kg is None or node_key not in kg.nodes:
+            if cls._looks_like_internal_id(node_key):
+                return ""
+            return str(node_key) if node_key is not None else ""
+        name = kg.nodes[node_key].get("id", None)
+        if name is None or cls._looks_like_internal_id(name):
+            if cls._looks_like_internal_id(node_key):
+                return ""
+            return str(node_key)
+        return str(name)
+
+    @classmethod
+    def _named_triple_from_nodes(
+        cls, kg: DiGraph, u: Any, v: Any, relation: Any
+    ) -> Optional[Tuple[str, str, str]]:
+        s = cls._node_display_name(kg, u)
+        o = cls._node_display_name(kg, v)
+        if not s or not o:
+            return None
+        if cls._looks_like_internal_id(s) or cls._looks_like_internal_id(o):
+            return None
+        return (s, str(relation or ""), o)
+
+    @classmethod
+    def _resolve_entity_arg(
+        cls,
+        name: Any,
+        kg: Optional[DiGraph] = None,
+        entity_to_id: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        if name is None:
+            return None
+        text = str(name).strip()
+        if not text:
+            return None
+        if not cls._looks_like_internal_id(text):
+            return text
+        if kg is not None and text in kg.nodes:
+            disp = cls._node_display_name(kg, text)
+            return disp or None
+        if entity_to_id:
+            for disp, key in entity_to_id.items():
+                if key == text and not cls._looks_like_internal_id(disp):
+                    return str(disp)
+        return None
+
+    @classmethod
+    def _sanitize_named_triple(
+        cls,
+        s: Any,
+        r: Any,
+        o: Any,
+        kg: Optional[DiGraph] = None,
+        entity_to_id: Optional[Dict[str, str]] = None,
+    ) -> Optional[Tuple[str, str, str]]:
+        s2 = cls._resolve_entity_arg(s, kg=kg, entity_to_id=entity_to_id)
+        o2 = cls._resolve_entity_arg(o, kg=kg, entity_to_id=entity_to_id)
+        if s2 is None or o2 is None:
+            return None
+        return (s2, str(r or ""), o2)
+
+    @staticmethod
     def _safe_sanitize(value: Any) -> str:
         if value is None:
             return ""
@@ -857,14 +914,34 @@ class RefinementInteraction(BaseInteraction):
 
     @staticmethod
     def _get_node_id(entity_name: str, entity_to_id: dict) -> str:
-        if entity_name not in entity_to_id:
-            entity_to_id[entity_name] = hashlib.sha256((entity_name + "_entity").encode()).hexdigest()
-        return entity_to_id[entity_name]
+        name = str(entity_name)
+        if _SHA256_HEX_RE.match(name.strip()):
+            # Do not mint a new entity whose *name* is a hash; keep identity only
+            # when this hash is already an internal key value.
+            for _disp, key in entity_to_id.items():
+                if key == name:
+                    return name
+            raise ValueError(f"Refusing to mint entity from internal hash id: {name}")
+        if name not in entity_to_id:
+            entity_to_id[name] = hashlib.sha256((name + "_entity").encode()).hexdigest()
+        return entity_to_id[name]
 
     def _insert_edge(self, instance_id: str, sub: str, rel: str, obj: str) -> None:
         inst = self._instance_dict[instance_id]
         kg = inst["kg"]
         eid = inst["entity_to_id"]
+        kg_full = inst.get("kg_full")
+        sub_r = self._resolve_entity_arg(sub, kg=kg_full or kg, entity_to_id=eid)
+        obj_r = self._resolve_entity_arg(obj, kg=kg_full or kg, entity_to_id=eid)
+        if sub_r is None or obj_r is None:
+            logger.warning(
+                "Skip insert_edge with unresolved internal id args: %s | %s | %s",
+                sub,
+                rel,
+                obj,
+            )
+            return
+        sub, obj = sub_r, obj_r
         sid, oid = self._get_node_id(sub, eid), self._get_node_id(obj, eid)
         if sid not in kg.nodes:
             kg.add_node(sid, id=self._safe_sanitize(sub), type="entity")
@@ -876,21 +953,44 @@ class RefinementInteraction(BaseInteraction):
     def _delete_edge(self, instance_id: str, sub: str, obj: str) -> None:
         inst = self._instance_dict[instance_id]
         kg, eid = inst["kg"], inst["entity_to_id"]
-        sid, oid = self._get_node_id(sub, eid), self._get_node_id(obj, eid)
+        kg_full = inst.get("kg_full")
+        sub_r = self._resolve_entity_arg(sub, kg=kg_full or kg, entity_to_id=eid)
+        obj_r = self._resolve_entity_arg(obj, kg=kg_full or kg, entity_to_id=eid)
+        if sub_r is None or obj_r is None:
+            logger.warning(
+                "Skip delete_edge with unresolved internal id args: %s | %s", sub, obj
+            )
+            return
+        sid, oid = self._get_node_id(sub_r, eid), self._get_node_id(obj_r, eid)
         if kg.has_edge(sid, oid):
             kg.remove_edge(sid, oid)
 
     def _replace_node(self, instance_id: str, old_entity: str, new_entity: str) -> None:
         inst = self._instance_dict[instance_id]
         kg, eid = inst["kg"], inst["entity_to_id"]
+        kg_full = inst.get("kg_full")
+        old_r = self._resolve_entity_arg(old_entity, kg=kg_full or kg, entity_to_id=eid)
+        new_r = self._resolve_entity_arg(new_entity, kg=kg_full or kg, entity_to_id=eid)
+        if old_r is None or new_r is None:
+            logger.warning(
+                "Skip replace_node with unresolved internal id args: %s | %s",
+                old_entity,
+                new_entity,
+            )
+            return
+        old_entity, new_entity = old_r, new_r
         old_id = self._get_node_id(old_entity, eid)
         if old_id not in kg.nodes:
             return
         edges_add = []
         for _u, v, d in list(kg.edges(old_id, data=True)):
-            edges_add.append((new_entity, d.get("relation", ""), kg.nodes[v].get("id", str(v))))
+            neighbor = self._node_display_name(kg, v)
+            if neighbor:
+                edges_add.append((new_entity, d.get("relation", ""), neighbor))
         for u, _v, d in list(kg.in_edges(old_id, data=True)):
-            edges_add.append((kg.nodes[u].get("id", str(u)), d.get("relation", ""), new_entity))
+            neighbor = self._node_display_name(kg, u)
+            if neighbor:
+                edges_add.append((neighbor, d.get("relation", ""), new_entity))
         kg.remove_node(old_id)
         for s, r, o in edges_add:
             try:

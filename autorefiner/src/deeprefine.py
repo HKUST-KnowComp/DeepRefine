@@ -2,6 +2,7 @@ from __future__ import annotations
 import random
 import re
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import networkx as nx
 import numpy as np
@@ -13,13 +14,25 @@ from typing import Any, Dict, List, Tuple, Optional, Iterable, Set, Callable
 from atlas_rag.retriever.base import BaseEdgeRetriever, BasePassageRetriever
 from atlas_rag.llm_generator import LLMGenerator
 from atlas_rag.vectorstore.embedding_model import BaseEmbeddingModel
-from autorefiner.src.rag_server.deeprefine_prompt import REAFINER_JUDGEMENT_SYSTEM_PROMPT, REAFINER_JUDGEMENT_USER_PROMPT, \
-        REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT, REAFINER_ERROR_ABDUCTION_USER_PROMPT, \
-        REAFINER_KG_REFINEMENT_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_USER_PROMPT, \
-        REFINE_SUBGRAPH_SYSTEM_PROMPT, REFINE_SUBGRAPH_USER_PROMPT, \
-        REAFINER_FILTERING_SYSTEM_PROMPT, REAFINER_FILTERING_USER_PROMPT, \
-        REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT, REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT
+from autorefiner.src.rag_server.deeprefine_prompt import (
+    REAFINER_JUDGEMENT_SYSTEM_PROMPT,
+    REAFINER_JUDGEMENT_USER_PROMPT,
+    REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT,
+    REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT,
+    REAFINER_ERROR_ABDUCTION_USER_PROMPT,
+    REAFINER_ABDUCTION_USER_PROMPT,
+    REAFINER_KG_REFINEMENT_SYSTEM_PROMPT,
+    REAFINER_KG_REFINEMENT_USER_PROMPT,
+    REFINE_SUBGRAPH_SYSTEM_PROMPT,
+    REFINE_SUBGRAPH_USER_PROMPT,
+    REAFINER_FILTERING_SYSTEM_PROMPT,
+    REAFINER_FILTERING_USER_PROMPT,
+    REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT,
+    REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT,
+    REAFINER_ACTION_USER_PROMPT,
+)
 from atlas_rag.retriever.simple_retriever import SimpleGraphRetriever
+from autorefiner.src.rag_server.incremental_graph_retriever import IncrementalGraphRetriever
 from atlas_rag.retriever.hipporag import HippoRAGRetriever
 from atlas_rag.evaluation.evaluation import QAJudger
 from networkx import DiGraph
@@ -85,12 +98,20 @@ class DeepRefine:
         llm_generator: LLMGenerator,
         base_top_k: int = 10,
         increament_hop: int = 1,
-        max_hops: int = 4,
-        max_triple_num: int = 25,
+        max_hops: int = 3,
+        max_triple_num: int = 90,
         max_triple_num_by_step: Optional[List[int]] = None,
-        history_horizon_size: int = 2,
+        history_horizon_size: int = 3,
         if_gen_answer: bool = True,
         seed: int = 2026,
+        ground_inserts: bool = True,
+        ground_mode: str = "both",
+        require_query_overlap: bool = False,
+        skip_generic_objects: bool = True,
+        skip_conflict_inserts: bool = True,
+        skip_action_if_answerable: bool = True,
+        max_actions: int = 10,
+        max_format_retry: int = 2,
     ) -> None:
         """
         - data:           Dictionary containing the following keys:
@@ -105,9 +126,9 @@ class DeepRefine:
         - base_top_k:       TopK for text vector retrieval for the 1st step.
         - max_triple_num:   Maximum number of triples for subgraph pruning (used when max_triple_num_by_step is None).
         - max_triple_num_by_step: Optional per-step caps [step1, step2, ...] for retrieval top-N (step 1) and prune budget (step>=2).
-          If shorter than max_hops, the last value is repeated.
+          Defaults to training schedule [10, 50, 90] when None. If shorter than max_hops, the last value is repeated.
         - if_gen_answer:    Whether to generate answer in the refinement process.
-        - max_hops:         Maximum number of hops for subgraph expansion.
+        - max_hops:         Maximum number of hops for subgraph expansion (training default: 3).
         - history_horizon_size: Size of the interaction history to be considered for error abduction.
         """
         self.data = data
@@ -120,22 +141,46 @@ class DeepRefine:
         self.edge_embeddings = data["edge_embeddings"]
         self.sentence_encoder = sentence_encoder
         self.llm_generator = llm_generator
-        self.retriever = SimpleGraphRetriever(
-                            llm_generator=self.llm_generator,
-                            sentence_encoder=self.sentence_encoder,
-                            data=self.data,
-                        )
-        # self.retriever = HippoRAGRetriever(
-        #             llm_generator=self.llm_generator,
-        #             sentence_encoder=self.sentence_encoder,
-        #             data=data,
-        #         )
         self.base_top_k = base_top_k
         self.max_hops = max_hops
         self.increament_hop = increament_hop
         self.history_horizon_size = history_horizon_size
         self.if_gen_answer = if_gen_answer
         self.max_triple_num = max_triple_num
+        # Offline / eval tricks (default on): reduce hallucinated inserts that pollute the global KG.
+        self.ground_inserts = bool(ground_inserts)
+        mode = (ground_mode or "both").strip().lower()
+        if mode not in {"both", "either", "off"}:
+            mode = "both"
+        self.ground_mode = mode
+        if mode == "off":
+            self.ground_inserts = False
+        self.require_query_overlap = bool(require_query_overlap)
+        self.skip_generic_objects = bool(skip_generic_objects)
+        self.skip_conflict_inserts = bool(skip_conflict_inserts)
+        # When final judgement is Yes, skip abduction/action (anti-pollution for global KG merge).
+        # Training still abducts after Yes on hop>1; this is an offline-only divergence.
+        self.skip_action_if_answerable = bool(skip_action_if_answerable)
+        self.max_actions = int(max_actions)
+        self.max_format_retry = int(max_format_retry)
+        self._GENERIC_OBJECTS = {
+            "",
+            "unknown",
+            "n/a",
+            "na",
+            "none",
+            "null",
+            "?",
+            "-",
+            "not mentioned",
+            "not specified",
+            "unspecified",
+        }
+        # Per-thread ephemeral state so parallel propose (apply_actions=False) is safe.
+        self._tls = threading.local()
+        # Align with training RefinementInteraction when caller omits the schedule.
+        if max_triple_num_by_step is None:
+            max_triple_num_by_step = [10, 50, 90]
         self._max_triple_num_by_step: Optional[List[int]] = (
             list(max_triple_num_by_step) if max_triple_num_by_step is not None else None
         )
@@ -156,10 +201,12 @@ class DeepRefine:
         self.text_id_to_node_name = text_id_to_node_name    # text_id -> text string
         # filter out passage nodes - create a new mutable graph instead of a frozen view
         self.kg = DiGraph(self.kg.subgraph(self.node_list))
+        self.data["KG"] = self.kg
         self.node_id_to_attr_id = {self.kg.nodes[n]['id']: n for n in self.kg.nodes}
         self.qa_judge = QAJudger()
         self.entity_to_id = {}
-        # Initialize ID mapping tables (faiss_id -> list_index) for incremental updates without rebuild
+        # Initialize ID mapping tables BEFORE building the retriever so retrieve()
+        # can translate faiss_id -> edge_list index from the first call.
         # If mapping doesn't exist, create identity mapping (initial state: faiss_id == list_index)
         if "edge_faiss_id_to_list_idx" not in self.data:
             self.data["edge_faiss_id_to_list_idx"] = {i: i for i in range(len(self.edge_list))}
@@ -173,10 +220,19 @@ class DeepRefine:
             self.text_faiss_id_to_list_idx = self.data["text_faiss_id_to_list_idx"]
         else:
             self.text_faiss_id_to_list_idx = {}
-        # Per-query edge score cache: compute once, reuse in pruning.
-        self._edge_score_cache_query: Optional[str] = None
-        self._edge_score_cache_values: Optional[np.ndarray] = None
-        self._edge_score_cache_query_emb: Optional[np.ndarray] = None
+        # Build retriever after mapping + filtered KG are ready; share the same
+        # mapping dict object so insert/delete mutations are visible immediately.
+        self.retriever = IncrementalGraphRetriever(
+                            llm_generator=self.llm_generator,
+                            sentence_encoder=self.sentence_encoder,
+                            data=self.data,
+                        )
+        # self.retriever = HippoRAGRetriever(
+        #             llm_generator=self.llm_generator,
+        #             sentence_encoder=self.sentence_encoder,
+        #             data=data,
+        #         )
+        # Per-query edge score cache lives on self._tls (see properties below).
 
     def _max_triples_at_step(self, step: int) -> int:
         """step is 1-indexed (matches refine loop)."""
@@ -191,11 +247,101 @@ class DeepRefine:
     # ------------------------------------------------------------------
     # Main interface for external use
     # ------------------------------------------------------------------
+    @staticmethod
+    def format_original_chunk(original_chunk: Any) -> str:
+        """Normalize HotpotQA / MuSiQue / plain context into action-prompt text (training-aligned)."""
+        if original_chunk is None:
+            return ""
+        if isinstance(original_chunk, str):
+            return original_chunk.strip()
+        if isinstance(original_chunk, (list, tuple)):
+            # HotpotQA / 2Wiki: [[title, [sent, ...]], ...]
+            if (
+                original_chunk
+                and isinstance(original_chunk[0], (list, tuple))
+                and len(original_chunk[0]) >= 2
+                and isinstance(original_chunk[0][1], list)
+            ):
+                parts: List[str] = []
+                for item in original_chunk:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    paragraphs = item[1]
+                    if not isinstance(paragraphs, list):
+                        continue
+                    for p in paragraphs:
+                        if isinstance(p, str) and p.strip():
+                            parts.append(p.strip())
+                        elif p is not None and str(p).strip():
+                            parts.append(str(p).strip())
+                return "\n\n".join(parts)
+            # MuSiQue: [{"paragraph_text": ...}, ...]
+            if original_chunk and isinstance(original_chunk[0], dict) and "paragraph_text" in original_chunk[0]:
+                parts = []
+                for item in original_chunk:
+                    if isinstance(item, dict):
+                        text = item.get("paragraph_text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                return "\n\n".join(parts)
+            return "\n\n".join(str(x) for x in original_chunk if str(x).strip())
+        return str(original_chunk).strip()
+
+    # ---- Per-thread query-scoped state (safe for parallel propose) ----
+    @property
+    def _current_query(self) -> str:
+        return getattr(self._tls, "current_query", "")
+
+    @_current_query.setter
+    def _current_query(self, value: str) -> None:
+        self._tls.current_query = value or ""
+
+    @property
+    def _edge_score_cache_query(self) -> Optional[str]:
+        return getattr(self._tls, "edge_score_cache_query", None)
+
+    @_edge_score_cache_query.setter
+    def _edge_score_cache_query(self, value: Optional[str]) -> None:
+        self._tls.edge_score_cache_query = value
+
+    @property
+    def _edge_score_cache_values(self) -> Optional[np.ndarray]:
+        return getattr(self._tls, "edge_score_cache_values", None)
+
+    @_edge_score_cache_values.setter
+    def _edge_score_cache_values(self, value: Optional[np.ndarray]) -> None:
+        self._tls.edge_score_cache_values = value
+
+    @property
+    def _edge_score_cache_query_emb(self) -> Optional[np.ndarray]:
+        return getattr(self._tls, "edge_score_cache_query_emb", None)
+
+    @_edge_score_cache_query_emb.setter
+    def _edge_score_cache_query_emb(self, value: Optional[np.ndarray]) -> None:
+        self._tls.edge_score_cache_query_emb = value
+
     def refine(
-        self, query: str,
+        self,
+        query: str,
+        original_chunk: Any = None,
+        apply_actions: bool = True,
     ) -> Tuple[str, nx.DiGraph, Optional[RefinementResult]]:
         """
         Run the entire REAfiner process for a single query.
+
+        Aligned with training RefinementInteraction (Search-R1 continuous trajectory):
+        - Judgement rounds with monotonic working-context expansion
+          (caps from ``max_triple_num_by_step``, default [10, 50, 90]).
+        - Later judgements only receive *newly added* triples
+          (``REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT``).
+        - Abduction / Action continue the same message history; phase system
+          prompts are injected into the user turn (same as training rollout).
+        - ``original_chunk`` (training ``interaction_kwargs.original_chunk``) is preferred
+          for the action prompt; falls back to passages reconstructed from the subgraph.
+        - Final RAG / answer generation is optional (``if_gen_answer``); training
+          keeps RAG reward-only outside the policy trajectory.
+        - ``apply_actions``: if False, only propose refinement callables (read-only on KG)
+          so callers can parallelize propose then apply serially.
 
         Returns:
         -------
@@ -205,58 +351,65 @@ class DeepRefine:
         """
         interaction_history: List[RetrievalStepResult] = []
         final_answer: str = ""
+        short_answer: Optional[str] = None
         base_top_k = self.base_top_k
+        chunk_text = self.format_original_chunk(original_chunk)
+        self._current_query = query or ""
         # Prime similarity cache once for this query; later pruning can directly reuse scores.
         self._get_or_compute_edge_scores(query)
 
+        # Continuous conversation (Search-R1 style), matching training rollout.
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": REAFINER_JUDGEMENT_SYSTEM_PROMPT.strip()}
+        ]
+        sorted_context: List[str] = []
+        answerable = False
+        judgement_raw: Optional[str] = None
+
         for step in range(1, self.max_hops + 1):
             print(f"\033[94m [Step: {step}] \033[0m")
-            # top-k Retrieve (retrieve a subgraph on the existing KG with vector search)
+            previous_context = set(sorted_context)
+
             if step == 1:
-                # Step-1 top-k: with per-step schedule, cap retrieval by schedule[0]; else use base_top_k only.
+                # First round: retrieve up to schedule[0] (aligned with training cap0).
                 if self._max_triple_num_by_step:
                     topn1 = min(base_top_k, self._max_triples_at_step(1))
                 else:
                     topn1 = base_top_k
-                sorted_context, sorted_context_ids = self.retriever.retrieve(query, topN=topn1)
-                # subgraph_triples = sorted([(triple.split("  ")[0], triple.split("  ")[1], triple.split("  ")[2]) for triple in sorted_context])
+                sorted_context, _ = self.retriever.retrieve(query, topN=topn1)
+                sorted_context = self._sanitize_context_list(sorted_context)
+                user_content = REAFINER_JUDGEMENT_USER_PROMPT.format(
+                    question=query,
+                    triples_string="\n".join(sorted_context) if sorted_context else "(no triples)",
+                ).strip()
             else:
-                # expand the sub-graph with k-hop retrieval
-                # # prune before expanding
-                # if len(subgraph_triples) > self.max_triple_num:
-                #     pruned_result = self._prune_subgraph_llm(subgraph_triples, query)
-                #     pruned_subgraph_triples, prune_raw = pruned_result
-                #     if prune_raw is not None:
-                #         sorted_context = pruned_subgraph_triples
-                #     else:
-                #         print(pruned_subgraph_triples)
-                #         pass
-                # obtain node ids from the previous step
-                node_str_list = []
-                for triple_str in sorted_context:
-                    if len(triple_str.split("  ")) != 3:
-                        print(f"Error: triple string {triple_str} is not in the correct format")
-                        continue
-                    head_node_str, rel, tail_node_str = triple_str.split("  ")
-                    node_str_list.append(head_node_str)
-                    node_str_list.append(tail_node_str)
-                node_str_list = sorted(set[Any](node_str_list))
-                node_id_list = [self.node_id_to_attr_id.get(node_str, node_str) for node_str in node_str_list]
-                # retrieve k-hop subgraph with the given node ids
-                subgraph = self._construct_subgraph(node_id_list, num_hop=self.increament_hop)
-                # convert subgraph to triple strings
-                subgraph_triples = sorted([(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)])
-                sorted_context = [f"{s}  {r}  {o}" for s, r, o in subgraph_triples]
+                # Monotonic expand: keep prior triples, add local then global candidates up to cap.
                 cap = self._max_triples_at_step(step)
-                if len(subgraph_triples) > cap:
-                    sorted_context = self._prune_subgraph_embd(subgraph_triples, query, max_triple_cap=cap)
-            retrieved_context = "\n".join(sorted_context)
-            retrieved_subgraph = [{"subject": f"{x.split('  ')[0]}", "relation": f"{x.split('  ')[1]}", "object": f"{x.split('  ')[2]}"} for x in sorted_context]
+                sorted_context, added = self._expand_sorted_context_monotonic(
+                    query=query,
+                    sorted_context=sorted_context,
+                    cap=cap,
+                )
+                sorted_context = self._sanitize_context_list(sorted_context)
+                added = self._sanitize_context_list(added)
+                if not added and len(sorted_context) <= len(previous_context):
+                    # Nothing new to show; stop expanding and move to abduction/action.
+                    print(
+                        f"\033[93m [Step {step}] no new triples under cap={cap}; "
+                        f"stop judgement expansion \033[0m"
+                    )
+                    break
+                triples_string = "\n".join(added) if added else "(no new triples)"
+                user_content = REAFINER_EXPANDED_JUDGEMENT_USER_PROMPT.format(
+                    triples_string=triples_string
+                ).strip()
 
-            # Answerable Judgement
-            answerable, judgement_raw = self._answerable_judgement(query, retrieved_context)
+            retrieved_subgraph = self._sorted_context_to_subgraph(sorted_context)
+
+            answerable, judgement_raw = self._answerable_judgement_messages(
+                messages, user_content
+            )
             if judgement_raw is None:
-                # fallback
                 interaction_history.append(
                     RetrievalStepResult(
                         num_hops=(step - 1) * self.increament_hop,
@@ -264,7 +417,7 @@ class DeepRefine:
                         query=query,
                         retrieved_subgraph=retrieved_subgraph,
                         raw_response=None,
-                        answerable=answerable,
+                        answerable=bool(answerable),
                         answer=None,
                     )
                 )
@@ -278,41 +431,38 @@ class DeepRefine:
                     refinement_action_list=[],
                     refinement_action_raw=None,
                 )
-                return (interaction_history[-1].answer, self.data, refinement_result)
+                return (None, self.data, refinement_result)
 
+            if self.if_gen_answer:
+                final_answer = self._generate_answer(
+                    query, "\n".join(sorted_context)
+                )
+                short_answer = self.qa_judge.split_answer(final_answer)
+
+            interaction_history.append(
+                RetrievalStepResult(
+                    num_hops=(step - 1) * self.increament_hop,
+                    base_top_k=base_top_k,
+                    query=query,
+                    retrieved_subgraph=retrieved_subgraph,
+                    raw_response=judgement_raw,
+                    answerable=bool(answerable),
+                    answer=short_answer if self.if_gen_answer else None,
+                )
+            )
+
+            # Answerable: stop expanding (hop1 Yes skips action below; hop>1 still
+            # abducts in training, but offline may skip via skip_action_if_answerable).
             if answerable:
-                if self.if_gen_answer:
-                    final_answer = self._generate_answer(query, retrieved_context)
-                    short_answer = self.qa_judge.split_answer(final_answer)
-                interaction_history.append(
-                    RetrievalStepResult(
-                        num_hops=(step - 1) * self.increament_hop,
-                        base_top_k=base_top_k,
-                        query=query,
-                        retrieved_subgraph=retrieved_subgraph,
-                        raw_response=judgement_raw,
-                        answerable=True,
-                        answer=short_answer if self.if_gen_answer else None,
-                    )
-                )
                 break
-            else:
-                if self.if_gen_answer:
-                    final_answer = self._generate_answer(query, retrieved_context)
-                    short_answer = self.qa_judge.split_answer(final_answer)
-                interaction_history.append(
-                    RetrievalStepResult(
-                        num_hops=(step - 1) * self.increament_hop,
-                        base_top_k=base_top_k,
-                        query=query,
-                        retrieved_subgraph=retrieved_subgraph,
-                        raw_response=judgement_raw,
-                        answerable=False,
-                        answer=short_answer if self.if_gen_answer else None,
-                    )
-                )
-        if len(interaction_history) <= 1:
-            # 1-hop is enough to answer the query
+            # Not answerable: continue expanding while hops remain.
+
+        # Training: skip abduction/action only when the *first* judgement is Yes.
+        last_answerable = bool(interaction_history and interaction_history[-1].answerable)
+        if (
+            len(interaction_history) == 1
+            and interaction_history[0].answerable
+        ) or (self.skip_action_if_answerable and last_answerable):
             refinement_result = RefinementResult(
                 query=query,
                 history_horizon_size=self.history_horizon_size,
@@ -324,41 +474,25 @@ class DeepRefine:
                 refinement_action_raw=None,
             )
             return (interaction_history[-1].answer, self.data, refinement_result)
-        else:
-            # Error Abduction
-            error_abduction_reason, error_abduction_raw = self._error_abduction(interaction_history)
-            if error_abduction_reason is None:
-                # fallback
-                refinement_result = RefinementResult(
-                    query=query,
-                    history_horizon_size=self.history_horizon_size,
-                    interaction_history=interaction_history,
-                    error_abduction_reason=error_abduction_reason,
-                    original_subgraph=interaction_history[-1].retrieved_subgraph,
-                    refined_subgraph=None,
-                    refinement_action_list=[],
-                    refinement_action_raw=None,
-                )
-                return (interaction_history[-1].answer, self.data, refinement_result)
-            # Refined KG Generation
-            refinement_action_list, refinement_action_raw = self._kg_refinement_action(query, interaction_history[-1].retrieved_subgraph, error_abduction_reason)
-            if refinement_action_raw is None:
-                # fallback
-                refinement_result = RefinementResult(
-                    query=query,
-                    history_horizon_size=self.history_horizon_size,
-                    interaction_history=interaction_history,
-                    error_abduction_reason=error_abduction_reason,
-                    original_subgraph=interaction_history[-1].retrieved_subgraph,
-                    refined_subgraph=None,
-                    refinement_action_list=refinement_action_list,
-                    refinement_action_raw=refinement_action_raw,
-                )
-                return (interaction_history[-1].answer, self.data, refinement_result)
-            # take actions
-            for action in refinement_action_list:
-                action()
-            # summarize the refinement result
+
+        if not interaction_history:
+            refinement_result = RefinementResult(
+                query=query,
+                history_horizon_size=self.history_horizon_size,
+                interaction_history=interaction_history,
+                error_abduction_reason=None,
+                original_subgraph=None,
+                refined_subgraph=None,
+                refinement_action_list=[],
+                refinement_action_raw=None,
+            )
+            return (None, self.data, refinement_result)
+
+        # ---- Abduction (continue the same trajectory) ----
+        error_abduction_reason, error_abduction_raw = self._error_abduction_messages(
+            messages
+        )
+        if error_abduction_reason is None:
             refinement_result = RefinementResult(
                 query=query,
                 history_horizon_size=self.history_horizon_size,
@@ -366,10 +500,484 @@ class DeepRefine:
                 error_abduction_reason=error_abduction_reason,
                 original_subgraph=interaction_history[-1].retrieved_subgraph,
                 refined_subgraph=None,
-                refinement_action_list=refinement_action_list,
+                refinement_action_list=[],
+                refinement_action_raw=None,
+            )
+            return (interaction_history[-1].answer, self.data, refinement_result)
+
+        # ---- Action generation (continue the same trajectory) ----
+        # Prefer sample context (training original_chunk); fallback to reconstructed passages.
+        original_text = chunk_text or self._collect_original_text(
+            interaction_history[-1].retrieved_subgraph
+        )
+        refinement_action_list, refinement_action_raw = self._kg_refinement_action_messages(
+            messages,
+            original_text=original_text,
+            query=query,
+            triples=interaction_history[-1].retrieved_subgraph,
+            error_abduction_reason=error_abduction_reason,
+        )
+        if refinement_action_raw is None:
+            refinement_result = RefinementResult(
+                query=query,
+                history_horizon_size=self.history_horizon_size,
+                interaction_history=interaction_history,
+                error_abduction_reason=error_abduction_reason,
+                original_subgraph=interaction_history[-1].retrieved_subgraph,
+                refined_subgraph=None,
+                refinement_action_list=refinement_action_list
+                if isinstance(refinement_action_list, list)
+                else [],
                 refinement_action_raw=refinement_action_raw,
             )
             return (interaction_history[-1].answer, self.data, refinement_result)
+
+        for action in refinement_action_list:
+            if apply_actions:
+                action()
+
+        refinement_result = RefinementResult(
+            query=query,
+            history_horizon_size=self.history_horizon_size,
+            interaction_history=interaction_history,
+            error_abduction_reason=error_abduction_reason,
+            original_subgraph=interaction_history[-1].retrieved_subgraph,
+            refined_subgraph=None,
+            refinement_action_list=refinement_action_list,
+            refinement_action_raw=refinement_action_raw,
+        )
+        return (interaction_history[-1].answer, self.data, refinement_result)
+
+    @staticmethod
+    def _sorted_context_to_subgraph(sorted_context: List[str]) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        for x in sorted_context:
+            parts = x.split("  ")
+            if len(parts) != 3:
+                continue
+            out.append(
+                {"subject": parts[0], "relation": parts[1], "object": parts[2]}
+            )
+        return out
+
+    def _expand_sorted_context_monotonic(
+        self,
+        query: str,
+        sorted_context: List[str],
+        cap: int,
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Training-aligned expansion: keep current triples, then add local 1-hop
+        and global candidates ranked by query similarity up to ``cap``.
+
+        Returns (new_sorted_context, newly_added_triples_only).
+        """
+        current: List[Tuple[str, str, str]] = []
+        for triple_str in sorted_context or []:
+            cleaned = self._sanitize_named_triple_str(triple_str)
+            if cleaned is not None:
+                current.append(cleaned)
+
+        if not current or len(current) >= cap:
+            cleaned_ctx = [f"{s}  {r}  {o}" for s, r, o in current]
+            return cleaned_ctx, []
+
+        id_to_node = {
+            str(self.kg.nodes[n].get("id", "")): n
+            for n in self.kg.nodes()
+            if self.kg.nodes[n].get("id") is not None
+            and not self._looks_like_internal_id(self.kg.nodes[n].get("id"))
+        }
+        # Also allow resolving by internal key when a prior bug leaked hashes into context.
+        for n in self.kg.nodes():
+            id_to_node.setdefault(str(n), n)
+
+        initial_nodes = {
+            id_to_node[entity]
+            for s, _, o in current
+            for entity in (s, o)
+            if entity in id_to_node
+        }
+
+        local_triples: List[Tuple[str, str, str]] = []
+        if initial_nodes:
+            local_graph = self._construct_subgraph(
+                list(initial_nodes), num_hop=self.increament_hop
+            )
+            # Always resolve display names from the full KG. Subgraph node keys are
+            # internal sha256 ids; using local_graph.nodes[u].get("id", u) without
+            # copied attrs used to leak hashes into the LLM prompt.
+            local_triples = []
+            for u, v, d in local_graph.edges(data=True):
+                named = self._named_triple_from_edge(u, v, d.get("relation", ""))
+                if named is not None:
+                    local_triples.append(named)
+
+        global_triples = []
+        for u, v, d in self.kg.edges(data=True):
+            named = self._named_triple_from_edge(u, v, d.get("relation", ""))
+            if named is not None:
+                global_triples.append(named)
+
+        selected: List[Tuple[str, str, str]] = list(dict.fromkeys(current))
+        selected_set = set(selected)
+        for candidates in (local_triples, global_triples):
+            remaining = cap - len(selected)
+            if remaining <= 0:
+                break
+            unseen = [t for t in candidates if t not in selected_set]
+            if not unseen:
+                continue
+            # Reuse embedding prune scorer: convert to "s  r  o" then back.
+            ranked_strs = self._prune_subgraph_embd(
+                unseen, query, max_triple_cap=remaining
+            )
+            ranked = []
+            for s in ranked_strs:
+                cleaned = self._sanitize_named_triple_str(s)
+                if cleaned is not None:
+                    ranked.append(cleaned)
+            selected.extend(ranked)
+            selected_set.update(ranked)
+
+        new_context = [f"{s}  {r}  {o}" for s, r, o in selected]
+        prior = set(self._sanitize_context_list(sorted_context or []))
+        added = [t for t in new_context if t not in prior]
+        return new_context, added
+
+    def _answerable_judgement_messages(
+        self,
+        messages: List[Dict[str, str]],
+        user_content: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """Append user turn, call LLM, append assistant; mutate ``messages`` in place."""
+        messages.append({"role": "user", "content": user_content})
+        try:
+            raw = self.llm_generator.generate_response(
+                messages, temperature=0.0, max_new_tokens=256
+            )
+        except Exception as e:
+            error_message = {"error": f"Answerable Judgement Generation Error: {e}"}
+            print(error_message)
+            return False, None
+
+        print(raw)
+        messages.append({"role": "assistant", "content": raw if isinstance(raw, str) else str(raw)})
+
+        judge_match = re.search(r"<judge>(.*?)</judge>", raw, re.IGNORECASE | re.DOTALL)
+        if judge_match:
+            answerable = judge_match.group(1).strip().lower().startswith("yes")
+        else:
+            text_lower = (raw or "").lower()
+            window = text_lower[:200]
+            if "yes" in window and "no" not in window:
+                answerable = True
+            elif "no" in window and "yes" not in window:
+                answerable = False
+            else:
+                print([{"error": f"Answerable Judgement Error Format: {raw}"}])
+                return False, None
+        return answerable, raw
+
+    def _error_abduction_messages(
+        self, messages: List[Dict[str, str]]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Continue trajectory: inject abduction phase instruction into user turn."""
+        user_content = (
+            f"{REAFINER_ERROR_ABDUCTION_SYSTEM_PROMPT.strip()}\n\n"
+            f"{REAFINER_ABDUCTION_USER_PROMPT.strip()}"
+        )
+        messages.append({"role": "user", "content": user_content})
+        try:
+            raw = self.llm_generator.generate_response(messages, temperature=0.0)
+        except Exception as e:
+            print([{"error": f"Abduction Generation Error: {e}"}])
+            return None, None
+
+        print(raw)
+        messages.append({"role": "assistant", "content": raw if isinstance(raw, str) else str(raw)})
+
+        abduction_match = re.search(
+            r"<abduction>(.*?)</abduction>", raw, re.IGNORECASE | re.DOTALL
+        )
+        if abduction_match:
+            return abduction_match.group(1).strip(), raw
+        # Lenient fallback (same as training generate_response_refinement_simple)
+        return (raw or "").strip(), raw
+
+    def _collect_original_text(self, triples: List[Dict[str, str]]) -> str:
+        text_set = set()
+        for triple in triples or []:
+            if not isinstance(triple, dict):
+                continue
+            sub = triple.get("subject", "")
+            obj = triple.get("object", "")
+            sub_id = self._get_node_id(sub, self.entity_to_id)
+            obj_id = self._get_node_id(obj, self.entity_to_id)
+            sub_file_id = self.node_id_to_file_id.get(sub_id)
+            if sub_file_id is not None and sub_file_id in self.text_id_to_node_name:
+                text_set.add(self.text_id_to_node_name[sub_file_id])
+            obj_file_id = self.node_id_to_file_id.get(obj_id)
+            if obj_file_id is not None and obj_file_id in self.text_id_to_node_name:
+                text_set.add(self.text_id_to_node_name[obj_file_id])
+        return "\n\n".join(list(text_set)[:50])
+
+    _FORMAT_RETRY_PROMPT = (
+        "Your previous output could not be parsed. "
+        "You MUST wrap your refinement actions inside <refinement>...</refinement> tags. "
+        "Use ONLY the following functions, separated by |:\n"
+        '  insert_edge("subject", "relation", "object")\n'
+        '  delete_edge("subject", "object")\n'
+        '  replace_node("old_entity", "new_entity")\n'
+        "Example:\n"
+        "<refinement>"
+        'insert_edge("Albert Einstein", "born_in", "Ulm") | '
+        'delete_edge("Albert Einstein", "Berlin")'
+        "</refinement>\n"
+        "Try again. Output ONLY the <refinement>...</refinement> block."
+    )
+
+    def _entity_grounded(self, name: str, original_text_l: str, subgraph_ents: Set[str]) -> bool:
+        if not name:
+            return False
+        n = name.strip()
+        if not n:
+            return False
+        n_l = n.lower()
+        if original_text_l and n_l in original_text_l:
+            return True
+        # Soft match: entity appears as a token-ish substring in subgraph entity names.
+        for e in subgraph_ents:
+            e_l = e.lower()
+            if n_l == e_l or (len(n_l) >= 3 and (n_l in e_l or e_l in n_l)):
+                return True
+        return False
+
+    def _has_relation_conflict(self, sub: str, rel: str, obj: str) -> bool:
+        """True if KG already has sub --rel--> other_obj with a different object."""
+        sub_id = self._get_node_id(sub, self.entity_to_id)
+        if sub_id not in self.kg:
+            return False
+        rel_n = self._safe_sanitize(rel).strip().lower()
+        obj_n = self._safe_sanitize(obj).strip().lower()
+        for _, dst, data in self.kg.out_edges(sub_id, data=True):
+            existing_rel = str(data.get("relation", "")).strip().lower()
+            if existing_rel != rel_n:
+                continue
+            existing_obj = str(self.kg.nodes[dst].get("id", dst)).strip().lower()
+            if existing_obj and existing_obj != obj_n:
+                return True
+        return False
+
+    def _filter_parsed_actions(
+        self,
+        parsed: List[Tuple[str, List[str]]],
+        *,
+        original_text: str,
+        triples: List[Dict[str, str]],
+    ) -> List[Callable[[], None]]:
+        """Apply offline anti-pollution filters; return callables ready to execute."""
+        original_text_l = (original_text or "").lower()
+        subgraph_ents: Set[str] = set()
+        for t in triples or []:
+            if isinstance(t, dict):
+                if t.get("subject"):
+                    subgraph_ents.add(str(t["subject"]))
+                if t.get("object"):
+                    subgraph_ents.add(str(t["object"]))
+
+        out: List[Callable[[], None]] = []
+        for function_name, args in parsed:
+            try:
+                if function_name == "insert_edge":
+                    if len(args) < 3:
+                        continue
+                    sub, rel, obj = args[0], args[1], args[2]
+                    sub = self._resolve_entity_arg(sub)
+                    obj = self._resolve_entity_arg(obj)
+                    if sub is None or obj is None:
+                        print(f"Skip insert_edge with unresolved internal id args: {args}")
+                        continue
+                    if self.skip_generic_objects and str(obj).strip().lower() in self._GENERIC_OBJECTS:
+                        print(f"Skip insert_edge with generic object: {sub} | {rel} | {obj}")
+                        continue
+                    if self.ground_inserts and original_text_l:
+                        # Require subject/object grounded in source text OR retrieved subgraph.
+                        sub_ok = self._entity_grounded(sub, original_text_l, subgraph_ents)
+                        obj_ok = self._entity_grounded(obj, original_text_l, subgraph_ents)
+                        need_both = self.ground_mode != "either"
+                        if need_both and not (sub_ok and obj_ok):
+                            print(
+                                f"Skip ungrounded insert_edge: {sub} | {rel} | {obj} "
+                                f"(sub_ok={sub_ok}, obj_ok={obj_ok}, mode={self.ground_mode})"
+                            )
+                            continue
+                        if (not need_both) and not (sub_ok or obj_ok):
+                            print(
+                                f"Skip ungrounded insert_edge: {sub} | {rel} | {obj} "
+                                f"(sub_ok={sub_ok}, obj_ok={obj_ok}, mode={self.ground_mode})"
+                            )
+                            continue
+                    if self.require_query_overlap and self._current_query:
+                        q_l = self._current_query.lower()
+                        if not (
+                            self._entity_grounded(sub, q_l, set())
+                            or self._entity_grounded(obj, q_l, set())
+                        ):
+                            print(
+                                f"Skip insert_edge without query overlap: {sub} | {rel} | {obj}"
+                            )
+                            continue
+                    if self.skip_conflict_inserts and self._has_relation_conflict(sub, rel, obj):
+                        print(f"Skip conflicting insert_edge: {sub} | {rel} | {obj}")
+                        continue
+                    out.append(lambda s=sub, r=rel, o=obj: self._insert_edge(s, r, o))
+                elif function_name == "delete_edge":
+                    if len(args) < 2:
+                        continue
+                    sub, obj = args[0], args[-1]
+                    sub = self._resolve_entity_arg(sub)
+                    obj = self._resolve_entity_arg(obj)
+                    if sub is None or obj is None:
+                        print(f"Skip delete_edge with unresolved internal id args: {args}")
+                        continue
+                    out.append(lambda s=sub, o=obj: self._delete_edge(s, o))
+                elif function_name == "replace_node":
+                    if len(args) < 2:
+                        continue
+                    old_ent, new_ent = args[0], args[1]
+                    old_ent = self._resolve_entity_arg(old_ent)
+                    new_ent = self._resolve_entity_arg(new_ent)
+                    if old_ent is None or new_ent is None:
+                        print(f"Skip replace_node with unresolved internal id args: {args}")
+                        continue
+                    if self.ground_inserts and original_text_l:
+                        if not self._entity_grounded(new_ent, original_text_l, subgraph_ents):
+                            print(f"Skip ungrounded replace_node: {old_ent} -> {new_ent}")
+                            continue
+                    out.append(lambda old=old_ent, new=new_ent: self._replace_node(old, new))
+                else:
+                    print(f"Error: Unknown action format: {function_name}")
+            except Exception as e:
+                print([{"error": f"KG Refinement Action Filter Error: {args}, Error: {e}"}])
+            if len(out) >= self.max_actions:
+                break
+        return out
+
+    def _parse_refinement_actions_str(self, raw: str) -> Tuple[Optional[str], bool]:
+        """Return (actions_str, parse_ok). Empty refinement is OK; unparseable junk is not."""
+        if raw is None:
+            return None, False
+        if raw.count("delete_edge") > 20 or raw.count("insert_edge") > 30:
+            print([{"error": "clip"}])
+            return None, False
+        refinement_match = re.search(
+            r"<refinement>(.*?)</refinement>", raw, re.IGNORECASE | re.DOTALL
+        )
+        if refinement_match:
+            return refinement_match.group(1).strip().strip("|"), True
+        if re.search(r"<refinement\s*/>", raw, re.IGNORECASE):
+            return "", True
+        calls = re.findall(
+            r"(?:insert_edge|delete_edge|replace_node)\s*\(.*?\)",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if calls:
+            return "|".join(calls), True
+        # Training-tolerant: empty / prose without actions -> treat as no-op success
+        if not re.search(r"(?:insert_edge|delete_edge|replace_node)\s*\(", raw, re.IGNORECASE):
+            return "", True
+        return None, False
+
+    def _kg_refinement_action_messages(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        original_text: str,
+        query: str,
+        triples: List[Dict[str, str]],
+        error_abduction_reason: str,
+    ) -> Tuple[Any, Optional[str]]:
+        """Continue trajectory: match training RefinementInteraction action turn.
+
+        Training injects ACTION system prompt as environment text, then
+        ``REAFINER_ACTION_USER_PROMPT`` only (KG/question/abduction already in
+        the prior multi-turn history). Do **not** re-dump legacy single-shot
+        fields (triples/question/error_reasons) — that breaks true multi-turn.
+        """
+        del query, error_abduction_reason  # available in conversation history
+        continuous_user = REAFINER_ACTION_USER_PROMPT.format(
+            original_text=original_text
+        ).strip()
+        user_content = (
+            f"{REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT.strip()}\n\n"
+            f"{continuous_user}"
+        )
+        messages.append({"role": "user", "content": user_content})
+
+        last_raw: Optional[str] = None
+        for attempt in range(self.max_format_retry + 1):
+            try:
+                raw = self.llm_generator.generate_response(
+                    messages, temperature=0.0, max_new_tokens=2048
+                )
+                print(raw)
+            except Exception as e:
+                print([{"error": f"KG Refinement Action Generation Error: {e}"}])
+                return [], None
+
+            last_raw = raw if isinstance(raw, str) else str(raw)
+            messages.append({"role": "assistant", "content": last_raw})
+
+            actions_str, parse_ok = self._parse_refinement_actions_str(last_raw)
+            if not parse_ok:
+                if attempt < self.max_format_retry:
+                    print(
+                        f"\033[93m [Format retry {attempt + 1}/{self.max_format_retry}] \033[0m"
+                    )
+                    messages.append({"role": "user", "content": self._FORMAT_RETRY_PROMPT})
+                    continue
+                print([{"error": f"KG Refinement Error Format: {last_raw}"}])
+                return [], last_raw
+
+            parsed: List[Tuple[str, List[str]]] = []
+            hard_fail = False
+            for action in re.split(r"[\|\n]+", actions_str or ""):
+                action = action.strip()
+                if not action:
+                    continue
+                try:
+                    function_name, args = self._parse_action_string(action)
+                    parsed.append((function_name, args))
+                except Exception as e:
+                    print(
+                        [
+                            {
+                                "error": (
+                                    f"KG Refinement Action Error Format: {action}, "
+                                    f"Error: {str(e)}"
+                                )
+                            }
+                        ]
+                    )
+                    hard_fail = True
+                    break
+            if hard_fail:
+                if attempt < self.max_format_retry:
+                    print(
+                        f"\033[93m [Format retry {attempt + 1}/{self.max_format_retry}] \033[0m"
+                    )
+                    messages.append({"role": "user", "content": self._FORMAT_RETRY_PROMPT})
+                    continue
+                return [], last_raw
+
+            refinement_action_list = self._filter_parsed_actions(
+                parsed, original_text=original_text, triples=triples
+            )
+            return refinement_action_list, last_raw
+
+        return [], last_raw
 
     def _set_seed(self, seed: int) -> None:
         random.seed(seed)
@@ -557,12 +1165,12 @@ class DeepRefine:
         2) 1-hop neighbor sampled triples around retrieved nodes
         """
         retrieved_context, _ = self.retriever.retrieve(query, topN=retrieve_topk)
-        candidate = set(retrieved_context)
-        if one_hop_sample_size <= 0 or not retrieved_context:
+        candidate = set(self._sanitize_context_list(retrieved_context))
+        if one_hop_sample_size <= 0 or not candidate:
             return candidate
 
         node_str_list = []
-        for triple_str in retrieved_context:
+        for triple_str in candidate:
             parts = triple_str.split("  ")
             if len(parts) != 3:
                 continue
@@ -572,7 +1180,12 @@ class DeepRefine:
         node_id_list = [self.node_id_to_attr_id.get(node_str, node_str) for node_str in node_str_list]
         subgraph = self._construct_subgraph(node_id_list, num_hop=1)
         subgraph_triples = sorted(
-            [(self.kg.nodes[u]['id'], d['relation'], self.kg.nodes[v]['id']) for u, v, d in subgraph.edges(data=True)]
+            {
+                named
+                for u, v, d in subgraph.edges(data=True)
+                for named in [self._named_triple_from_edge(u, v, d.get("relation", ""))]
+                if named is not None
+            }
         )
         if not subgraph_triples:
             return candidate
@@ -593,7 +1206,7 @@ class DeepRefine:
         scored_subgraph.sort(key=lambda x: x[0], reverse=True)
         for _, s, r, o in scored_subgraph[:one_hop_sample_size]:
             candidate.add(f"{s}  {r}  {o}")
-        return candidate
+        return set(self._sanitize_context_list(list(candidate)))
 
     def select_refine_subset(
         self,
@@ -859,7 +1472,7 @@ class DeepRefine:
                 text_set.add(self.text_id_to_node_name[obj_file_id])
         system_prompt = REAFINER_KG_REFINEMENT_ACTION_SYSTEM_PROMPT
         user_prompt = REAFINER_KG_REFINEMENT_ACTION_USER_PROMPT.format(
-            original_text=str(list(text_set)[:15]),
+            original_text=str(list(text_set)[:50]),
             question=query,
             triples_string=triples_string,
             error_reasons=error_abduction_reason,
@@ -918,16 +1531,31 @@ class DeepRefine:
                     if len(args) != 3:
                         raise ValueError(f"insert_edge requires 3 arguments, got {len(args)}")
                     sub, rel, obj = args[0], args[1], args[2]
+                    sub = self._resolve_entity_arg(sub)
+                    obj = self._resolve_entity_arg(obj)
+                    if sub is None or obj is None:
+                        print(f"Skip insert_edge with unresolved internal id args: {args}")
+                        continue
                     refinement_action_list.append(lambda s=sub, r=rel, o=obj: self._insert_edge(s, r, o))
                 elif function_name == "delete_edge":
                     if len(args) != 3:
                         raise ValueError(f"delete_edge requires 3 arguments, got {len(args)}")
                     sub, rel, obj = args[0], args[1], args[2]
+                    sub = self._resolve_entity_arg(sub)
+                    obj = self._resolve_entity_arg(obj)
+                    if sub is None or obj is None:
+                        print(f"Skip delete_edge with unresolved internal id args: {args}")
+                        continue
                     refinement_action_list.append(lambda s=sub, o=obj: self._delete_edge(s, o))
                 elif function_name == "replace_node":
                     if len(args) != 2:
                         raise ValueError(f"replace_node requires 2 arguments, got {len(args)}")
                     old_ent, new_ent = args[0], args[1]
+                    old_ent = self._resolve_entity_arg(old_ent)
+                    new_ent = self._resolve_entity_arg(new_ent)
+                    if old_ent is None or new_ent is None:
+                        print(f"Skip replace_node with unresolved internal id args: {args}")
+                        continue
                     refinement_action_list.append(lambda old=old_ent, new=new_ent: self._replace_node(old, new))
                 else:
                     print(f"Error: Unknown action format: {function_name}")
@@ -1008,6 +1636,17 @@ class DeepRefine:
         """
         Insert an edge into the KG.
         """
+        sub_resolved = self._resolve_entity_arg(sub)
+        obj_resolved = self._resolve_entity_arg(obj)
+        if sub_resolved is None or obj_resolved is None:
+            print(
+                "Action Error: refuse insert_edge with unresolved internal id: ",
+                sub,
+                rel,
+                obj,
+            )
+            return
+        sub, obj = sub_resolved, obj_resolved
         subject_mapped_id = self._get_node_id(sub, self.entity_to_id)
         object_mapped_id = self._get_node_id(obj, self.entity_to_id)
         new_node_list = []
@@ -1056,7 +1695,11 @@ class DeepRefine:
             if new_edge_faiss_embeddings.ndim == 1:
                 new_edge_faiss_embeddings = new_edge_faiss_embeddings.reshape(1, -1)
             faiss.normalize_L2(new_edge_faiss_embeddings)
-            next_faiss_id = max(self.edge_faiss_id_to_list_idx.keys()) + 1
+            next_faiss_id = (
+                max(self.edge_faiss_id_to_list_idx.keys()) + 1
+                if self.edge_faiss_id_to_list_idx
+                else 0
+            )
             self.edge_list.append((subject_mapped_id, object_mapped_id))
             self.edge_embeddings.append(new_edge_embeddings)
             self._append_cached_edge_score(new_edge_embeddings)
@@ -1064,7 +1707,9 @@ class DeepRefine:
             self.edge_faiss_id_to_list_idx[next_faiss_id] = len(self.edge_list) - 1
         # update the node_list and node_embeddings
         if new_node_list:
-            new_node_embeddings = self.sentence_encoder.encode(new_node_list, query_type="node")
+            # Encode human-readable names, never internal hash keys.
+            name_list = [self._node_display_name(n) or str(n) for n in new_node_list]
+            new_node_embeddings = self.sentence_encoder.encode(name_list, query_type="node")
             if isinstance(new_node_embeddings, torch.Tensor):
                 new_node_embeddings = new_node_embeddings.cpu().numpy()
             new_node_embeddings = np.array(new_node_embeddings)
@@ -1081,6 +1726,11 @@ class DeepRefine:
             self.node_faiss_index.add_with_ids(new_node_faiss_embeddings, faiss_ids)
             for i, faiss_id in enumerate(faiss_ids):
                 self.node_faiss_id_to_list_idx[int(faiss_id)] = start_list_idx + i
+            # Keep name -> internal-key map in sync for later retrieval/expansion.
+            for n in new_node_list:
+                disp = self._node_display_name(n)
+                if disp:
+                    self.node_id_to_attr_id[disp] = n
         # update the data
         self.data["KG"] = self.kg
         self.data["edge_list"] = self.edge_list
@@ -1104,6 +1754,16 @@ class DeepRefine:
         """
         Delete an edge from the KG.
         """
+        sub_resolved = self._resolve_entity_arg(sub)
+        obj_resolved = self._resolve_entity_arg(obj)
+        if sub_resolved is None or obj_resolved is None:
+            print(
+                "Action Error: refuse delete_edge with unresolved internal id: ",
+                sub,
+                obj,
+            )
+            return
+        sub, obj = sub_resolved, obj_resolved
         subject_mapped_id = self._get_node_id(sub, self.entity_to_id)
         object_mapped_id = self._get_node_id(obj, self.entity_to_id)
         edge_tuple = (subject_mapped_id, object_mapped_id)
@@ -1158,6 +1818,16 @@ class DeepRefine:
         """
         Replace a node in the KG.
         """
+        old_resolved = self._resolve_entity_arg(old_entity)
+        new_resolved = self._resolve_entity_arg(new_entity)
+        if old_resolved is None or new_resolved is None:
+            print(
+                "Action Error: refuse replace_node with unresolved internal id: ",
+                old_entity,
+                new_entity,
+            )
+            return
+        old_entity, new_entity = old_resolved, new_resolved
         old_mapped_id = self._get_node_id(old_entity, self.entity_to_id)
         new_mapped_id = self._get_node_id(new_entity, self.entity_to_id)
         if not self.kg.has_node(old_mapped_id):
@@ -1167,13 +1837,13 @@ class DeepRefine:
         edges_to_preserve = []
         edges_to_delete = []
         for neighbor in sorted(self.kg.successors(old_mapped_id)):
-            neighbor_id = self.kg.nodes[neighbor].get("id", None)
+            neighbor_id = self._node_display_name(neighbor)
             if neighbor_id:
                 relation = self.kg.edges[old_mapped_id, neighbor]["relation"]
                 edges_to_preserve.append((new_entity, relation, neighbor_id))
                 edges_to_delete.append((old_entity, neighbor_id))
         for neighbor in sorted(self.kg.predecessors(old_mapped_id)):
-            neighbor_id = self.kg.nodes[neighbor].get("id", None)
+            neighbor_id = self._node_display_name(neighbor)
             if neighbor_id:
                 relation = self.kg.edges[neighbor, old_mapped_id]["relation"]
                 edges_to_preserve.append((neighbor_id, relation, new_entity))
@@ -1227,17 +1897,116 @@ class DeepRefine:
         """
         return self.llm_generator.generate_with_context_kg(query, subgraph_str, temperature=0.0)
 
-    def _get_node_id(self, entity_name, entity_to_id={}):
-        """Returns existing or creates new nX ID for an entity using a hash-based approach."""
-        if entity_name not in entity_to_id:
-            # Use a hash function to generate a unique ID
-            entity_name = entity_name+'_entity'
-            hash_object = hashlib.sha256(entity_name.encode('utf-8'))
-            hash_hex = hash_object.hexdigest()  # Get the hexadecimal representation of the hash
-            # Use the first 8 characters of the hash as the ID (you can adjust the length as needed)
-            entity_to_id[entity_name] = hash_hex
-        return entity_to_id[entity_name]
-    
+    def _get_node_id(self, entity_name, entity_to_id=None):
+        """Returns existing or creates new hash key for an entity (internal graph key only)."""
+        if entity_to_id is None:
+            entity_to_id = self.entity_to_id
+        name = str(entity_name)
+        # Never register a bare sha256 string as an entity *name* (would re-hash and
+        # also leak into prompts if used as node["id"]).
+        if self._looks_like_internal_id(name):
+            if hasattr(self, "kg") and name in self.kg.nodes:
+                return name
+            for _disp, key in entity_to_id.items():
+                if key == name:
+                    return name
+            raise ValueError(f"Refusing to mint entity from internal hash id: {name}")
+        if name not in entity_to_id:
+            hash_object = hashlib.sha256((name + "_entity").encode("utf-8"))
+            entity_to_id[name] = hash_object.hexdigest()
+        return entity_to_id[name]
+
+    @staticmethod
+    def _looks_like_internal_id(value: Any) -> bool:
+        """True for sha256-hex internal node keys that must never appear in prompts."""
+        if value is None:
+            return False
+        s = str(value).strip()
+        if len(s) != 64:
+            return False
+        try:
+            int(s, 16)
+            return True
+        except ValueError:
+            return False
+
+    def _node_display_name(self, node_key: Any) -> str:
+        """Human-readable entity name for prompts; never the internal hash key."""
+        attrs = {}
+        if hasattr(self, "kg") and node_key in self.kg.nodes:
+            attrs = self.kg.nodes[node_key]
+        name = attrs.get("id", None)
+        if name is None or self._looks_like_internal_id(name):
+            # Last resort: if node_key itself is not a hash, use it; else empty.
+            if not self._looks_like_internal_id(node_key):
+                return str(node_key)
+            return ""
+        return str(name)
+
+    def _resolve_entity_arg(self, name: Any) -> Optional[str]:
+        """Map action/prompt entity args to a human-readable name.
+
+        Bare sha256 keys are resolved via the KG when possible; otherwise None
+        so callers can skip writing hashes into the graph/prompts.
+        """
+        if name is None:
+            return None
+        text = str(name).strip()
+        if not text:
+            return None
+        if not self._looks_like_internal_id(text):
+            return text
+        # Arg is an internal key: recover display name if the node exists.
+        if text in self.kg.nodes:
+            disp = self._node_display_name(text)
+            return disp or None
+        for disp, key in self.entity_to_id.items():
+            if key == text and not self._looks_like_internal_id(disp):
+                return str(disp)
+        return None
+
+    def _named_triple_from_edge(
+        self, u: Any, v: Any, relation: Any
+    ) -> Optional[Tuple[str, str, str]]:
+        s = self._node_display_name(u)
+        o = self._node_display_name(v)
+        if not s or not o:
+            return None
+        if self._looks_like_internal_id(s) or self._looks_like_internal_id(o):
+            return None
+        return (s, str(relation or ""), o)
+
+    def _sanitize_named_triple(
+        self, s: Any, r: Any, o: Any
+    ) -> Optional[Tuple[str, str, str]]:
+        s2 = self._resolve_entity_arg(s)
+        o2 = self._resolve_entity_arg(o)
+        if s2 is None or o2 is None:
+            return None
+        return (s2, str(r or ""), o2)
+
+    def _sanitize_named_triple_str(
+        self, triple_str: str
+    ) -> Optional[Tuple[str, str, str]]:
+        parts = str(triple_str).split("  ", 2)
+        if len(parts) != 3:
+            return None
+        return self._sanitize_named_triple(parts[0].strip(), parts[1].strip(), parts[2].strip())
+
+    def _sanitize_context_list(self, context: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for triple_str in context or []:
+            cleaned = self._sanitize_named_triple_str(triple_str)
+            if cleaned is None:
+                continue
+            s = f"{cleaned[0]}  {cleaned[1]}  {cleaned[2]}"
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
     def _safe_sanitize(self, value):
         """Safely sanitize any value for XML output."""
         def _sanitize_xml_string(s: str) -> str:
@@ -1246,16 +2015,24 @@ class DeepRefine:
         if value is None:
             return ""
         return _sanitize_xml_string(str(value))
-    
+
     def _construct_subgraph(self, initial_nodes, num_hop: int = 1):
-        """Construct a multi-hop subgraph around initial nodes up to num_hop."""
+        """Construct a multi-hop subgraph around initial nodes up to num_hop.
+
+        Node/edge attributes are copied from ``self.kg`` so callers can read
+        human-readable ``id`` / ``relation`` fields (not internal hash keys).
+        """
         subgraph = DiGraph()
         visited = set()
-        queue = [(node, 0) for node in initial_nodes if node in self.node_list]
+        queue = [(node, 0) for node in initial_nodes if node in self.kg.nodes]
+
+        def _add_node(n):
+            if n not in subgraph:
+                subgraph.add_node(n, **dict(self.kg.nodes[n]))
 
         # Add initial nodes
         for node, _ in queue:
-            subgraph.add_node(node)
+            _add_node(node)
             visited.add(node)
 
         # Breadth-first search to collect neighbors
@@ -1265,33 +2042,38 @@ class DeepRefine:
                 continue
             # Add successors (outgoing edges)
             for neighbor in sorted(self.kg.successors(current_node)):
-                neighbor_id = self.kg.nodes[neighbor].get('id', None)
-                if neighbor_id.isdigit():
+                neighbor_id = self.kg.nodes[neighbor].get("id", None)
+                relation = self.kg.edges[(current_node, neighbor)].get("relation", "")
+                edge_attrs = dict(self.kg.edges[(current_node, neighbor)])
+                if neighbor_id is not None and str(neighbor_id).isdigit():
                     # Do not further explore this neighbor
-                    relation = self.kg.edges[(current_node, neighbor)]["relation"]
-                    subgraph.add_edge(current_node, neighbor, relation=relation)
+                    _add_node(neighbor)
+                    subgraph.add_edge(current_node, neighbor, **edge_attrs)
                     continue
                 if neighbor not in visited:
                     visited.add(neighbor)
-                    subgraph.add_node(neighbor)
+                    _add_node(neighbor)
                     queue.append((neighbor, hop_count + 1))
-                relation = self.kg.edges[(current_node, neighbor)]["relation"]
-                subgraph.add_edge(current_node, neighbor, relation=relation)
+                else:
+                    _add_node(neighbor)
+                subgraph.add_edge(current_node, neighbor, **edge_attrs)
 
             # Add predecessors (incoming edges)
             for neighbor in sorted(self.kg.predecessors(current_node)):
-                neighbor_id = self.kg.nodes[neighbor].get('id', None)
-                if neighbor_id.isdigit():
+                neighbor_id = self.kg.nodes[neighbor].get("id", None)
+                edge_attrs = dict(self.kg.edges[(neighbor, current_node)])
+                if neighbor_id is not None and str(neighbor_id).isdigit():
                     # Do not further explore this neighbor
-                    relation = self.kg.edges[(neighbor, current_node)]["relation"]
-                    subgraph.add_edge(neighbor, current_node, relation=relation)
+                    _add_node(neighbor)
+                    subgraph.add_edge(neighbor, current_node, **edge_attrs)
                     continue
                 if neighbor not in visited:
                     visited.add(neighbor)
-                    subgraph.add_node(neighbor)
+                    _add_node(neighbor)
                     queue.append((neighbor, hop_count + 1))
-                relation = self.kg.edges[(neighbor, current_node)]["relation"]
-                subgraph.add_edge(neighbor, current_node, relation=relation)
+                else:
+                    _add_node(neighbor)
+                subgraph.add_edge(neighbor, current_node, **edge_attrs)
 
         return subgraph
 

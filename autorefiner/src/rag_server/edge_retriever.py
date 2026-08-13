@@ -13,6 +13,7 @@ import math
 from autorefiner.src.rag_server.tog_prompt import REASONING_PROMPT, ANSWER_GENERATION_PROMPT, FEW_SHOT_EXAMPLE
 import jellyfish
 import logging 
+import torch
 
 def batch(iterable, n=100):
     l = len(iterable)
@@ -33,8 +34,15 @@ class EdgeRetriever(BaseRetriever):
         triples = [f"{src} {rel} {dst}" for src, dst, rel in kg.edges(data="relation")]
         triple_embeddings = []
         for triple_batch in batch(triples, batch_size):
-            triple_embeddings.extend(await self.reranker.embed(triple_batch))
-        self.triple_embeddings = np.array(triple_embeddings)
+            # Keep batched tensor via cat; list.extend(tensor)+np.array makes object-array.
+            emb = await self.reranker.embed(triple_batch)
+            if not isinstance(emb, torch.Tensor):
+                emb = torch.as_tensor(emb, dtype=torch.float32)
+            triple_embeddings.append(emb.detach().float().cpu())
+        if triple_embeddings:
+            self.triple_embeddings = torch.cat(triple_embeddings, dim=0)
+        else:
+            self.triple_embeddings = torch.zeros((0, 0), dtype=torch.float32)
         
         assert len(self.triple_embeddings) == len(kg.edges), f"len(triple_embeddings): {len(self.triple_embeddings)}, len(kg.edges): {len(kg.edges)}"
         def get_query_instruct(sub_query: str) -> str:
@@ -43,6 +51,8 @@ class EdgeRetriever(BaseRetriever):
         
         self.query_instruct = get_query_instruct(query)
         self.query_embedding = await self.reranker.embed([self.query_instruct])
+        if not isinstance(self.query_embedding, torch.Tensor):
+            self.query_embedding = torch.as_tensor(self.query_embedding, dtype=torch.float32)
     
     async def retrieve_context(self, question: str, kg: DiGraph, sampling_params: dict, **kwargs) -> str:
         """
@@ -50,6 +60,9 @@ class EdgeRetriever(BaseRetriever):
         """
         self.KG = kg
         self.sampling_params = sampling_params
+        if kg is None or len(kg.edges) == 0:
+            logging.warning("EdgeRetriever.retrieve_context: empty KG edges.")
+            return json.dumps({"subgraph_context": ""})
         await self.index_kg(question, kg)
 
         # retrieve top N edges
@@ -73,6 +86,11 @@ class EdgeRetriever(BaseRetriever):
         """Retrieve a subgraph (or full KG) and generate an answer."""
         self.KG = kg
         self.sampling_params = sampling_params
+        # Guard: refined KG can have 0 edges after delete_edge; avoid matmul crash.
+        if kg is None or len(kg.edges) == 0:
+            logging.warning("EdgeRetriever: empty KG edges, return empty answer directly.")
+            return json.dumps({"answer": "", "subgraph_context": ""})
+
         await self.index_kg(question, kg)
 
         # retrieve top N edges

@@ -326,6 +326,9 @@ class SGLangRollout(BaseRollout):
         self._init_sampling_params(**kwargs)
 
         self.processing_class = processing_class
+        # This is needed while requests are preprocessed, before per-request
+        # rollout execution starts.
+        self.work_mode = getattr(self.config, "autograph_mode", None) or self.config.mode
         try:
             # This is when processing_class is a tokenizer
             self.pad_token_id = self.processing_class.pad_token_id
@@ -408,6 +411,10 @@ class SGLangRollout(BaseRollout):
             self.gen_acc_judge_generator = LLMGenerator(
                 self.gen_acc_judge_client, self.gen_acc_judge_model, backend="openai"
             )
+            # Process-local GenAcc judge cache: identical (pred, gold) must not flip Yes/No.
+            self._gen_acc_judge_cache: dict[tuple, bool] = {}
+            self._gen_acc_judge_inflight: dict[tuple, asyncio.Future] = {}
+            self._gen_acc_judge_cache_max = 10000
             #### Print custom config here
             print(f"RAG method: {self.rag_method} \n text_linking: {self.text_linking} \n freeze_answer_api: {self.freeze_answer_api} \n iterative: {self.iterative} \n tight: {self.tight}")
             print(f"Reward Function: {self.reward_function}")
@@ -684,7 +691,8 @@ class SGLangRollout(BaseRollout):
             - prompts: [bsz, prompt_length], prompt token ids from dataset.
             - responses: [bsz, response_length], output token ids include response tokens
               from LLM generation and observation tokens from tool_calls.
-            - response_mask: [bsz, response_length], 1 for LLM generated tokens, 0 for observation/padding tokens.
+            - response_mask: [bsz, response_length], 1 for trainable policy tokens, 0 for masked/padding tokens.
+            - generation_mask: [bsz, response_length], 1 for all LLM-generated tokens.
             - input_ids: [bsz, prompt_length + response_length], whole sequence token ids, including prompt tokens
               and response tokens.
             - attention_mask: [bsz, prompt_length + response_length], 0 for padding tokens, 1 for other tokens.
@@ -941,8 +949,7 @@ class SGLangRollout(BaseRollout):
         had_format_error = False
 
         # Use autograph_mode if set, otherwise fall back to mode for backward compatibility
-        work_mode = getattr(self.config, 'autograph_mode', None) or self.config.mode
-        self.work_mode = work_mode
+        work_mode = self.work_mode
         
         if work_mode == "autograph":
             rag_state = AutoGraphStateEnum.CONSTRUCTING 
@@ -1054,7 +1061,11 @@ class SGLangRollout(BaseRollout):
                 # Only continue the conversation if the prompt length is not greater than max_model_len - 1,
                 # since SGLang raises an error when max_new_tokens + 1 is greater to max_model_len (the extra
                 # token accounts for the EOS token).
-                prompt_length = len(_req.get_generation_prompt_ids(self.processing_class))
+                if self.work_mode == "autorefine" and rag_state == AutoGraphStateEnum.RAG:
+                    # Final RAG is outside the policy trajectory.
+                    prompt_length = len(_req.input_ids)
+                else:
+                    prompt_length = len(_req.get_generation_prompt_ids(self.processing_class))
                 if prompt_length + 1 >= self.config.max_model_len:
                     finish_reason_type = FinishReasonTypeEnum.LENGTH
                     break
@@ -1104,10 +1115,19 @@ class SGLangRollout(BaseRollout):
                 # content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
-                # Only ACTION_GENERATION phase counts for loss; judgement and abduction do not.
-                refinement_loss_phase = rag_state == AutoGraphStateEnum.ACTION_GENERATION
+                refinement_loss_phase = rag_state in (
+                    AutoGraphStateEnum.ABDUCTION,
+                    AutoGraphStateEnum.ACTION_GENERATION,
+                )
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
-                    if rag_state in (AutoGraphStateEnum.CONSTRUCTING, AutoGraphStateEnum.ABDUCTION, AutoGraphStateEnum.ACTION_GENERATION):
+                    if rag_state == AutoGraphStateEnum.RAG:
+                        _req.interaction_kwargs["_reward_only_rag_output"] = content
+                    elif rag_state in (
+                        AutoGraphStateEnum.CONSTRUCTING,
+                        AutoGraphStateEnum.ABDUCTION,
+                        AutoGraphStateEnum.ACTION_GENERATION,
+                        AutoGraphStateEnum.ANSWERABLE_JUDGEMENT,
+                    ):
                         _req.add_assistant_message(self.processing_class, content)
                     else:
                         _req.add_assistant_message_without_loss(self.processing_class, content)
@@ -1162,11 +1182,14 @@ class SGLangRollout(BaseRollout):
                     else:
                         # no tool call
                         if rag_state == AutoGraphStateEnum.RAG:
-                            _req.add_assistant_message_without_loss(self.processing_class, content)
+                            # Final RAG is an environment-only reward observation. Keep
+                            # it for reward extraction, but do not add it to policy tensors.
+                            _req.interaction_kwargs["_reward_only_rag_output"] = content
                         elif rag_state == AutoGraphStateEnum.CONSTRUCTING:
                             _req.add_assistant_message(self.processing_class, content)
                         elif rag_state == AutoGraphStateEnum.ANSWERABLE_JUDGEMENT:
-                            _req.add_assistant_message_without_loss(self.processing_class, content)
+                            # _req.add_assistant_message_without_loss(self.processing_class, content)
+                            _req.add_assistant_message(self.processing_class, content)
                         elif rag_state == AutoGraphStateEnum.ABDUCTION:
                             _req.add_assistant_message(self.processing_class, content)
                         elif rag_state == AutoGraphStateEnum.ACTION_GENERATION:
@@ -1293,11 +1316,17 @@ class SGLangRollout(BaseRollout):
                         # print(triple_to_doc)
                 # past messages
                 messages = [{"role": x.role, "content": x.content} for x in _req.messages]
-                if rag_state in (
+                if rag_state == AutoGraphStateEnum.RAG:
+                    rag_output = _req.interaction_kwargs.get("_reward_only_rag_output")
+                    if rag_output is not None:
+                        messages.append({"role": "assistant", "content": rag_output})
+                is_refinement_phase = rag_state in (
                     AutoGraphStateEnum.ANSWERABLE_JUDGEMENT,
                     AutoGraphStateEnum.ABDUCTION,
                     AutoGraphStateEnum.ACTION_GENERATION,
-                ):
+                )
+                next_rs = None
+                if is_refinement_phase:
                     phase_map = {
                         AutoGraphStateEnum.ANSWERABLE_JUDGEMENT: "answerable_judgement",
                         AutoGraphStateEnum.ABDUCTION: "abduction",
@@ -1314,13 +1343,11 @@ class SGLangRollout(BaseRollout):
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                         break
-                    if extra.get("next_system"):
-                        # For refinement phases, we rebuild the conversation so that the current
-                        # phase's system prompt is the active one (many chat templates only look
-                        # at the first system message). We keep only the new system + user pair.
-                        _req.messages = []
-                        _req.add_system_message(self.processing_class, extra["next_system"])
                     next_rs = extra.get("next_rag_state")
+                    phase_instruction = extra.get("next_system")
+                    if phase_instruction and next_rs != "answerable_judgement":
+                        # keep all prior turns and inject phase instructions as masked environment text.
+                        content = f"{phase_instruction.strip()}\n\n{content.strip()}"
                     if next_rs == "rag":
                         rag_state = AutoGraphStateEnum.RAG
                         _req.interaction_kwargs["refined_kg_data"] = interaction._instance_dict[_req.request_id].get("kg")
@@ -1348,14 +1375,16 @@ class SGLangRollout(BaseRollout):
                         **_req.interaction_kwargs
                     )
                 is_rag = interaction._instance_dict[_req.request_id]["rag_state"]
-                user_turn_rewards.append(reward)
+                if not is_refinement_phase:
+                    user_turn_rewards.append(reward)
                 #TODO: 2026.2.6 add user and system messsages
                 if should_terminate_sequence:
                     finish_reason_type = FinishReasonTypeEnum.STOP
                     _req.state = AsyncRolloutRequestStateEnum.COMPLETED
                     break
                 else:
-                    _req.add_user_message(self.processing_class, content)
+                    if not (is_refinement_phase and next_rs == "rag"):
+                        _req.add_user_message(self.processing_class, content)
                     if len(_req.input_ids) >= self.config.max_model_len:
                         finish_reason_type = FinishReasonTypeEnum.STOP
                         break
@@ -1386,39 +1415,49 @@ class SGLangRollout(BaseRollout):
         if had_format_error:
             all_rewards["format_error"] = True
 
-        # Pre-compute GenAcc during rollout (LLM judge uses self.llm_generator)
-        if self.use_api and _req.interaction_kwargs:
+        refined_answer_text = None
+        rag_output = _req.interaction_kwargs.get("_reward_only_rag_output")
+        if rag_output is not None:
             try:
-                gold_answers = _req.interaction_kwargs.get("ground_truth", [])
-                if isinstance(gold_answers, str):
-                    gold_answers = [gold_answers]
+                obj = json_repair.loads(rag_output)
+                if isinstance(obj, dict) and "answer" in obj:
+                    refined_answer_text = obj["answer"]
+                elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
+                    refined_answer_text = obj[0].get("answer")
+            except Exception:
+                pass
+            if refined_answer_text is None and isinstance(rag_output, str):
+                refined_answer_text = rag_output
+            all_rewards["refined_answer_text"] = refined_answer_text
 
-                refined_answer_text = None
-                for msg in reversed(_req.messages):
-                    if msg.role == "assistant":
-                        try:
-                            import json_repair as _jr
-                            obj = _jr.loads(msg.content)
-                            if isinstance(obj, dict) and "answer" in obj:
-                                refined_answer_text = obj["answer"]
-                            elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
-                                refined_answer_text = obj[0].get("answer")
-                        except Exception:
-                            pass
-                        break
+        if self.reward_function == 'gbd_reward':
+            # Pre-compute GenAcc during rollout (LLM judge uses self.llm_generator)
+            if self.use_api and _req.interaction_kwargs:
+                try:
+                    gold_answers = self._clean_gold_answers(_req.interaction_kwargs.get("ground_truth", []))
+                    draft_answer_text = _req.interaction_kwargs.get("draft_answer")
 
-                draft_answer_text = _req.interaction_kwargs.get("draft_answer")
-
-                refined_acc, draft_acc = await asyncio.gather(
-                    self._compute_gen_acc_async(refined_answer_text, gold_answers),
-                    self._compute_gen_acc_async(draft_answer_text, gold_answers),
-                )
-
-                all_rewards["refined_acc"] = refined_acc
-                all_rewards["draft_acc"] = draft_acc
-                all_rewards["refined_answer_text"] = refined_answer_text
-            except Exception as e:
-                logger.warning("[GenAcc precompute] failed for request %s: %s", _req.request_id, e)
+                    if not gold_answers:
+                        # Bad / empty GT: neutral zero reward signal, skip judge calls.
+                        all_rewards["refined_acc"] = 0.0
+                        all_rewards["draft_acc"] = 0.0
+                        all_rewards["reward_invalid"] = True
+                        all_rewards["reward_invalid_reason"] = "empty_or_invalid_gold"
+                    elif self._answers_equivalent(refined_answer_text, draft_answer_text):
+                        # Same answer => one judgment only; never invent fake 01/10 flips.
+                        shared_acc = await self._compute_gen_acc_async(refined_answer_text, gold_answers)
+                        all_rewards["refined_acc"] = shared_acc
+                        all_rewards["draft_acc"] = shared_acc
+                        all_rewards["same_draft_refined"] = True
+                    else:
+                        refined_acc, draft_acc = await asyncio.gather(
+                            self._compute_gen_acc_async(refined_answer_text, gold_answers),
+                            self._compute_gen_acc_async(draft_answer_text, gold_answers),
+                        )
+                        all_rewards["refined_acc"] = refined_acc
+                        all_rewards["draft_acc"] = draft_acc
+                except Exception as e:
+                    logger.warning("[GenAcc precompute] failed for request %s: %s", _req.request_id, e)
 
         _req.finalize(self.processing_class, all_rewards, finish_reason_type)
         # Release per-request interaction state to avoid CPU memory growth across steps
@@ -1490,8 +1529,14 @@ class SGLangRollout(BaseRollout):
             interaction = self.interaction_map[interaction_name]
             # Pass initial messages to start_interaction so it can extract triples from pre-populated prompt
             interaction_kwargs_with_messages = {**interaction_kwargs, "initial_messages": _req.messages}
+            messages_before_start = [message.model_dump(exclude_none=True) for message in _req.messages]
             try:
                 await interaction.start_interaction(_req.request_id, **interaction_kwargs_with_messages)
+                messages_after_start = [message.model_dump(exclude_none=True) for message in _req.messages]
+                if messages_after_start != messages_before_start:
+                    # Keep the training trajectory tensors aligned with the prompt
+                    # actually sent to the rollout engine.
+                    _req.rebuild_initial_prompt(self.processing_class)
             except ValueError as e:
                 # Gracefully skip requests that do not have the necessary KG
                 # (e.g., missing draft_kg or prompt-injected KG context), instead
@@ -1508,20 +1553,20 @@ class SGLangRollout(BaseRollout):
                 else:
                     raise
 
-            # In autorefine mode, overwrite draft_answer with the answer from RAG on the original KG
-            # (refine 前的 KG), so gbd_reward uses rollout-time draft answer instead of dataset one.
             if (
                 _req.state != AsyncRolloutRequestStateEnum.COMPLETED
                 and getattr(self, "work_mode", None) == "autorefine"
                 and self.use_api
-                and self.rag_method == "re_edge"
+                and self.rag_method in ["re_edge", "re_subgraph", "re_hipporag"]
             ):
                 inst = interaction._instance_dict.get(_req.request_id)
                 if inst is not None:
-                    initial_kg = inst.get("kg")
+                    initial_kg = inst.get("kg_full")
                     question = _req.interaction_kwargs.get("question", "")
                     if initial_kg is not None and question:
                         from autorefiner.src.rag_server.subgraph_retriever import SubgraphRetriever
+                        from autorefiner.src.rag_server.edge_retriever import EdgeRetriever
+                        from autorefiner.src.rag_server.hipporag1 import HippoRAGRetriever
 
                         api_sampling_params = {
                             "max_new_tokens": min(
@@ -1533,18 +1578,35 @@ class SGLangRollout(BaseRollout):
                             "return_logprob": False,
                         }
                         try:
-                            retriever = SubgraphRetriever(
-                                self.retriever_config,
-                                self.gen_acc_judge_generator,
-                                self.reranker,
-                                set_llm_judge_model=self.set_llm_judge_model,
-                                llm_judge_generator=self.llm_judge_generator,
-                            )
+                            retriever = None
+                            if self.rag_method == "re_edge":
+                                retriever = EdgeRetriever(
+                                    self.retriever_config,
+                                    self.llm_judge_generator,
+                                    self.reranker
+                                )
+                            elif self.rag_method == "re_subgraph":
+                                retriever = SubgraphRetriever(
+                                    self.retriever_config,
+                                    self.llm_judge_generator,
+                                    self.reranker,
+                                    set_llm_judge_model=self.set_llm_judge_model,
+                                    llm_judge_generator=self.llm_judge_generator,
+                                )
+                            elif self.rag_method == "re_hipporag":
+                                retriever = HippoRAGRetriever(
+                                    self.retriever_config,
+                                    self.llm_judge_generator,
+                                    self.reranker,
+                                )
+                            else:
+                                raise NotImplementedError(f"rag_method='{self.rag_method}' not supported for autorefine")
+                            
                             draft_answer = await retriever.retrieve(
                                 question=question,
                                 kg=initial_kg,
                                 sampling_params=api_sampling_params,
-                                reward_function=self.reward_function,
+                                reward_function=self.reward_function
                             )
                             draft_answer_text = ""
                             if isinstance(draft_answer, str):
@@ -1686,6 +1748,7 @@ class SGLangRollout(BaseRollout):
         prompt_attention_mask, response_attention_mask = [], []
         prompt_position_ids, response_position_ids = [], []
         response_loss_mask = []
+        response_generation_mask = []
         messages = []
         reward_scores = []
         multi_modal_inputs = []
@@ -1701,9 +1764,11 @@ class SGLangRollout(BaseRollout):
                 == req.attention_mask.shape[-1]
                 == req.position_ids.shape[-1]
                 == req.loss_mask.shape[-1]
+                == req.generation_mask.shape[-1]
             ), f"""Request {req.request_id} has different length of 
                 {req.input_ids.shape[-1]=}, {req.attention_mask.shape[-1]=}, 
-                {req.position_ids.shape[-1]=}, {req.loss_mask.shape[-1]=}"""
+                {req.position_ids.shape[-1]=}, {req.loss_mask.shape[-1]=},
+                {req.generation_mask.shape[-1]=}"""
             error_message_lines = [
                 f"""Request {req.request_id} has input_ids length {req.input_ids.shape[-1]}
                     greater than max_model_len {self.config.max_model_len}""",
@@ -1728,6 +1793,7 @@ class SGLangRollout(BaseRollout):
             prompt_position_ids.append(req.prompt_position_ids.to(tgt_device).squeeze(0))
             response_position_ids.append(req.response_position_ids.to(tgt_device).squeeze(0))
             response_loss_mask.append(req.response_loss_mask.to(tgt_device).squeeze(0))
+            response_generation_mask.append(req.response_generation_mask.to(tgt_device).squeeze(0))
             messages.append({"messages": req.messages})
             reward_scores.append(req.reward_scores)
             multi_modal_inputs.append(req.multi_modal_inputs)
@@ -1797,6 +1863,9 @@ class SGLangRollout(BaseRollout):
         response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
         if response_loss_mask.shape[1] < self.config.response_length:
             response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
+        response_generation_mask = pad_sequence(response_generation_mask, batch_first=True, padding_value=0)
+        if response_generation_mask.shape[1] < self.config.response_length:
+            response_generation_mask = pad_sequence_to_length(response_generation_mask, self.config.response_length, 0)
         if self.config.calculate_log_probs:
             output_logprobs = pad_sequence(output_logprobs, padding_value=0.0, batch_first=True)
             output_logprobs = pad_sequence_to_length(
@@ -1819,6 +1888,7 @@ class SGLangRollout(BaseRollout):
                 "prompts": prompt_ids,
                 "responses": response_ids,
                 "response_mask": response_loss_mask,
+                "generation_mask": response_generation_mask,
                 "input_ids": input_ids,  # here input_ids become the whole sentences
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
@@ -1905,6 +1975,7 @@ class SGLangRollout(BaseRollout):
         padding_req.response_attention_mask = padding_response_attention_mask
         padding_req.response_position_ids = padding_response_position_ids
         padding_req.response_loss_mask = padding_response_loss_mask
+        padding_req.response_generation_mask = torch.zeros_like(padding_response_loss_mask)
         padding_req.reward_scores = {}
         padding_req.metrics = {}
         padding_req.output_token_ids = None
@@ -1965,7 +2036,12 @@ class SGLangRollout(BaseRollout):
                 max_prompt_len=self.config.prompt_length,
                 max_response_len=self.config.response_length,
                 max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
-                use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
+                # message history can drop generated template prefixes (for
+                # example Qwen3's <think> block) and diverge from training ids.
+                use_inference_chat_template=(
+                    self.config.multi_turn.use_inference_chat_template
+                    and self.work_mode != "autorefine"
+                ),
                 tokenization_sanity_check_mode=self.config.multi_turn.tokenization_sanity_check_mode,
                 chat_template_kwargs=dict(self.config.multi_turn.chat_template_kwargs),
                 processing_class=self.processing_class,
@@ -1974,12 +2050,14 @@ class SGLangRollout(BaseRollout):
             input_ids={req.input_ids.shape[-1]}, 
             attention_mask={req.attention_mask.shape[-1]}, 
             position_ids={req.position_ids.shape[-1]}, 
-            loss_mask={req.loss_mask.shape[-1]}"""
+            loss_mask={req.loss_mask.shape[-1]},
+            generation_mask={req.generation_mask.shape[-1]}"""
             assert (
                 req.input_ids.shape[-1]
                 == req.attention_mask.shape[-1]
                 == req.position_ids.shape[-1]
                 == req.loss_mask.shape[-1]
+                == req.generation_mask.shape[-1]
             ), error_message
             req_list.append(req)
 
@@ -2064,35 +2142,194 @@ class SGLangRollout(BaseRollout):
                 return True
         return False
 
-    async def _judge_check_async(self, prediction, gold_answers):
-        """Use dedicated gen_acc_judge_generator (third-party API) to judge correctness."""
-        gold_str = ", ".join('"' + str(a) + '"' for a in gold_answers)
-        prompt = (
-            "Given the following prediction and set of gold answers, determine if the "
-            "prediction contains or is semantically equivalent to any of the gold answers.\n\n"
-            'Prediction: "' + str(prediction) + '"\n'
-            "Gold Answers: " + gold_str + "\n\n"
-            "Does the prediction contain any of the gold answers? "
-            "Answer with ONLY 'Yes' or 'No'."
+    @staticmethod
+    def _strip_wrapping_quotes(text: str) -> str:
+        s = text.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1].strip()
+        return s
+
+    @classmethod
+    def _clean_gold_answers(cls, gold_answers) -> list[str]:
+        """Normalize GT list; drop empty / quote-only junk."""
+        if gold_answers is None:
+            return []
+        if isinstance(gold_answers, str):
+            gold_answers = [gold_answers]
+        cleaned: list[str] = []
+        for ans in gold_answers:
+            if ans is None:
+                continue
+            s = cls._strip_wrapping_quotes(str(ans))
+            if not s:
+                continue
+            if not cls._normalize_genacc(s):
+                continue
+            cleaned.append(s)
+        return cleaned
+
+    @classmethod
+    def _answers_equivalent(cls, a, b) -> bool:
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        return cls._normalize_genacc(a) == cls._normalize_genacc(b)
+
+    @staticmethod
+    def _judge_cache_key(prediction, gold_answers) -> tuple:
+        pred_key = SGLangRollout._normalize_genacc(prediction)
+        gold_key = tuple(sorted({SGLangRollout._normalize_genacc(str(a)) for a in gold_answers if str(a).strip()}))
+        return (pred_key, gold_key)
+
+    @staticmethod
+    def _parse_judge_response(text: Any) -> Optional[bool]:
+        """Parse common Yes/No judge responses without accepting ambiguous text."""
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+        if not cleaned:
+            return None
+
+        # Support structured responses such as {"answer": "Yes"}.
+        if cleaned[0] in '{["':
+            try:
+                parsed = json_repair.loads(cleaned)
+                if isinstance(parsed, bool):
+                    return parsed
+                if isinstance(parsed, str):
+                    cleaned = parsed.strip()
+                elif isinstance(parsed, dict):
+                    for key in ("answer", "verdict", "judgement", "judgment", "judge", "result"):
+                        value = parsed.get(key)
+                        if isinstance(value, bool):
+                            return value
+                        if isinstance(value, str) and value.strip().lower() in ("yes", "no"):
+                            return value.strip().lower() == "yes"
+            except Exception:
+                pass
+
+        xml_match = re.search(
+            r"<(?P<tag>judge|answer|verdict)>\s*(?P<label>yes|no)\s*</(?P=tag)>",
+            cleaned,
+            flags=re.IGNORECASE,
         )
-        try:
-            text = await self.gen_acc_judge_generator.generate_response(
-                [{"role": "user", "content": prompt}],
-                max_new_tokens=10,
-                temperature=0.0,
-                return_text_only=True,
+        if xml_match:
+            return xml_match.group("label").lower() == "yes"
+
+        labelled_match = re.search(
+            r"\b(?:answer|verdict|judg(?:e)?ment|result)\s*(?:is|:|=)\s*"
+            r"[*_`\"']*(yes|no)\b",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if labelled_match:
+            return labelled_match.group(1).lower() == "yes"
+
+        leading_match = re.match(r"^[\s*_`\"'\[\](){}<>:-]*(yes|no)\b", cleaned, flags=re.IGNORECASE)
+        if leading_match:
+            return leading_match.group(1).lower() == "yes"
+
+        labels = {label.lower() for label in re.findall(r"\b(yes|no)\b", cleaned, flags=re.IGNORECASE)}
+        if len(labels) == 1:
+            return labels.pop() == "yes"
+        return None
+
+    def _get_reader_judge_fallback(self):
+        """Local reader LLM used for RAG answering (e.g. Qwen2.5-7B on :8129)."""
+        # Prefer the same generator EdgeRetriever uses as the answer/reader model.
+        if getattr(self, "llm_judge_generator", None) is not None:
+            return self.llm_judge_generator, "llm_judge_generator(reader)"
+        if getattr(self, "freeze_answer_api", False) and getattr(self, "llm_generator", None) is not None:
+            return self.llm_generator, "llm_generator(reader)"
+        return None, None
+
+    async def _judge_check_async(self, prediction, gold_answers):
+        """Use dedicated gen_acc_judge_generator; fall back to local reader on failure."""
+        cache = getattr(self, "_gen_acc_judge_cache", None)
+        inflight = getattr(self, "_gen_acc_judge_inflight", None)
+        key = self._judge_cache_key(prediction, gold_answers)
+
+        if cache is not None and key in cache:
+            return cache[key]
+        if inflight is not None and key in inflight:
+            return await inflight[key]
+
+        async def _call_one_judge(generator, label: str):
+            """Return True/False if parsed; None if call failed or response unparseable."""
+            gold_str = ", ".join('"' + str(a) + '"' for a in gold_answers)
+            prompt = (
+                "Given the following prediction and set of gold answers, determine if the "
+                "prediction contains or is semantically equivalent to any of the gold answers.\n\n"
+                'Prediction: "' + str(prediction) + '"\n'
+                "Gold Answers: " + gold_str + "\n\n"
+                "Does the prediction contain any of the gold answers? "
+                "Answer with ONLY 'Yes' or 'No'."
             )
-            if isinstance(text, str):
-                return text.strip().lower().startswith("yes")
+            try:
+                text = await generator.generate_response(
+                    [{"role": "user", "content": prompt}],
+                    max_new_tokens=10,
+                    temperature=0.0,
+                    return_text_only=True,
+                )
+                # llm_api returns "" on timeout without raising — treat as failure.
+                if text is None or (isinstance(text, str) and not text.strip()):
+                    logger.warning("[judge_check_async] Empty judge response from %s", label)
+                    return None
+                parsed = self._parse_judge_response(text)
+                if parsed is not None:
+                    return parsed
+                logger.warning(
+                    "[judge_check_async] Unparseable judge response from %s: %r", label, text
+                )
+                return None
+            except Exception as e:
+                logger.warning("[judge_check_async] LLM call failed (%s): %s", label, e)
+                return None
+
+        async def _call_judge() -> bool:
+            parsed = await _call_one_judge(self.gen_acc_judge_generator, "gen_acc_judge")
+            if parsed is not None:
+                return parsed
+
+            fallback, fb_name = self._get_reader_judge_fallback()
+            if fallback is not None and fallback is not self.gen_acc_judge_generator:
+                logger.warning(
+                    "[judge_check_async] Primary judge failed; falling back to %s", fb_name
+                )
+                parsed = await _call_one_judge(fallback, fb_name)
+                if parsed is not None:
+                    return parsed
+
             return False
+
+        if inflight is None:
+            return await _call_judge()
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        inflight[key] = fut
+        try:
+            result = await _call_judge()
+            fut.set_result(result)
+            if cache is not None:
+                if len(cache) >= getattr(self, "_gen_acc_judge_cache_max", 10000):
+                    cache.clear()
+                cache[key] = result
+            return result
         except Exception as e:
-            logger.warning("[judge_check_async] LLM call failed: %s", e)
-            return False
+            fut.set_exception(e)
+            raise
+        finally:
+            inflight.pop(key, None)
 
     async def _compute_gen_acc_async(self, prediction, gold_answers):
         """GenAcc = span_check | judge_check. Returns 1.0 or 0.0."""
         if prediction is None or not str(prediction).strip():
             return 0.0
+        gold_answers = self._clean_gold_answers(gold_answers)
         if not gold_answers:
             return 0.0
         if self._span_check(prediction, gold_answers):
@@ -2112,18 +2349,11 @@ class SGLangRollout(BaseRollout):
         # refinement-produced KG; in autograph mode we parse triples from the
         # assistant output and then call the appropriate retriever.
         if self.work_mode == "autorefine":
-            # Currently only support re_edge for autorefine:
-            # use EdgeRetriever over the refined KG to both retrieve a subgraph
-            # and answer the question.
-            if self.rag_method != "re_edge":
-                raise NotImplementedError(f"autorefine work_mode only supports rag_method='re_edge', got {self.rag_method}")
+            if self.rag_method not in ["re_edge", "re_subgraph", "re_hipporag"]:
+                raise NotImplementedError(f"autorefine work_mode only supports rag_method='re_edge' or 're_subgraph' or 're_hipporag', got {self.rag_method}")
 
-            # Build sampling params in the same way as autograph path.
-            generation_prompt_ids = _req.get_generation_prompt_ids(self.processing_class)
-            max_new_tokens = min(
-                self.config.response_length,
-                self.config.max_model_len - len(generation_prompt_ids) - 1,
-            )
+            # Final RAG does not consume or mutate the policy trajectory.
+            max_new_tokens = self.config.response_length
             api_sampling_params = {
                 "max_new_tokens": max_new_tokens,
                 # "temperature": sampling_params.get("temperature", 0.7),
@@ -2135,22 +2365,41 @@ class SGLangRollout(BaseRollout):
             refined_kg = _req.interaction_kwargs.get("refined_kg_data")
 
             from autorefiner.src.rag_server.subgraph_retriever import SubgraphRetriever
+            from autorefiner.src.rag_server.edge_retriever import EdgeRetriever
+            from autorefiner.src.rag_server.hipporag1 import HippoRAGRetriever
+            retriever = None
 
             if refined_kg is None:
                 output_text = "Error: No refined KG found"
             else:
-                retriever = SubgraphRetriever(
-                    self.retriever_config,
-                    self.gen_acc_judge_generator,
-                    self.reranker,
-                    set_llm_judge_model=self.set_llm_judge_model,
-                    llm_judge_generator=self.llm_judge_generator,
-                )
+                if self.rag_method == "re_edge":
+                    retriever = EdgeRetriever(
+                        self.retriever_config,
+                        self.llm_judge_generator,
+                        self.reranker
+                    )
+                elif self.rag_method == "re_subgraph":
+                    retriever = SubgraphRetriever(
+                        self.retriever_config,
+                        self.llm_judge_generator,
+                        self.reranker,
+                        set_llm_judge_model=self.set_llm_judge_model,
+                        llm_judge_generator=self.llm_judge_generator,
+                    )
+                elif self.rag_method == "re_hipporag":
+                    retriever = HippoRAGRetriever(
+                        self.retriever_config,
+                        self.llm_judge_generator,
+                        self.reranker,
+                    )
+                else:
+                    raise NotImplementedError(f"rag_method='{self.rag_method}' not supported for autorefine")
+
                 answer = await retriever.retrieve(
                     question=question,
                     kg=refined_kg,
                     sampling_params=api_sampling_params,
-                    reward_function=self.reward_function,
+                    reward_function=self.reward_function
                 )
                 output_text = answer
 

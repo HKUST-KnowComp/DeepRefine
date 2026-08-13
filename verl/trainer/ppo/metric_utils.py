@@ -117,6 +117,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
+    policy_length = response_mask.sum(-1).float()
+    generation_length = (
+        batch.batch["generation_mask"].sum(-1).float()
+        if "generation_mask" in batch.batch
+        else policy_length
+    )
 
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask
@@ -214,6 +220,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
         .detach()
         .item(),
+        # Search-R1 style length breakdown: response/trajectory includes
+        # environment tokens, generation includes all assistant outputs, and
+        # policy includes only tokens optimized by PPO.
+        "trajectory_length/mean": torch.mean(response_length).detach().item(),
+        "trajectory_length/max": torch.max(response_length).detach().item(),
+        "trajectory_length/min": torch.min(response_length).detach().item(),
+        "trajectory_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
+        .detach()
+        .item(),
+        "generation_length/mean": torch.mean(generation_length).detach().item(),
+        "generation_length/max": torch.max(generation_length).detach().item(),
+        "generation_length/min": torch.min(generation_length).detach().item(),
+        "policy_length/mean": torch.mean(policy_length).detach().item(),
+        "policy_length/max": torch.max(policy_length).detach().item(),
+        "policy_length/min": torch.min(policy_length).detach().item(),
         # response length (non-aborted only)
         # These statistics exclude aborted samples to avoid skew from zeros
         "response_length_non_aborted/mean": non_aborted_response_length_mean,

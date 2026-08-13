@@ -51,6 +51,36 @@ def _normalize_genacc(s):
     return " ".join(tokens)
 
 
+def _strip_wrapping_quotes(text: str) -> str:
+    s = text.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1].strip()
+    return s
+
+
+def _clean_gold_answers(gold_answers):
+    if gold_answers is None:
+        return []
+    if isinstance(gold_answers, str):
+        gold_answers = [gold_answers]
+    cleaned = []
+    for ans in gold_answers:
+        if ans is None:
+            continue
+        s = _strip_wrapping_quotes(str(ans))
+        if s and _normalize_genacc(s):
+            cleaned.append(s)
+    return cleaned
+
+
+def _answers_equivalent(a, b) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    return _normalize_genacc(a) == _normalize_genacc(b)
+
+
 # ---------------------------------------------------------------------------
 # GenAcc: span_check | judge_check
 # ---------------------------------------------------------------------------
@@ -74,7 +104,7 @@ def judge_check(prediction, gold_answers, api_url=None, model_name=None, timeout
     endpoint (synchronous requests call)."""
     if api_url is None:
         api_url = os.environ.get(
-            "REWARD_LLM_API_URL", "http://0.0.0.0:8129/v1/chat/completions"
+            "REWARD_LLM_API_URL", "http://127.0.0.1:8129/v1/chat/completions"
         )
     if not api_url.endswith("/chat/completions"):
         api_url = api_url.rstrip("/") + "/chat/completions"
@@ -110,6 +140,7 @@ def gen_acc(prediction, gold_answers, use_judge=True, api_url=None, model_name=N
     """
     if prediction is None or not str(prediction).strip():
         return 0.0
+    gold_answers = _clean_gold_answers(gold_answers)
     if not gold_answers:
         return 0.0
     if span_check(prediction, gold_answers):
@@ -286,9 +317,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         answer = None
         triple_repetition = 0.0
 
-    target = ground_truth.get("target", [])
-    if isinstance(target, str):
-        target = [target]
+    target = _clean_gold_answers(ground_truth.get("target", []))
 
     # Read rollout_reward_scores once
     rollout_scores = {}
@@ -297,21 +326,15 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         if not isinstance(rollout_scores, dict):
             rollout_scores = {}
 
-    # Prefer the answer extracted during rollout (from message objects) over
-    # extract_solution (from serialized token string) to stay consistent with
-    # the pre-computed GenAcc values.
+    # Prefer the reward-only RAG answer extracted during rollout over
+    # extract_solution (from the policy trajectory).
     rollout_answer = rollout_scores.get("refined_answer_text")
     if rollout_answer is not None:
         answer = rollout_answer
 
     precomputed_refined = rollout_scores.get("refined_acc")
     precomputed_draft = rollout_scores.get("draft_acc")
-
-    # GenAcc for refined answer
-    if precomputed_refined is not None:
-        current_acc = float(precomputed_refined)
-    else:
-        current_acc = gen_acc(answer, target, use_judge=False)
+    reward_invalid = bool(rollout_scores.get("reward_invalid"))
 
     # Extract draft_answer
     draft_answer = None
@@ -323,6 +346,31 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
             interaction_kwargs = extra_info.get("interaction_kwargs") or {}
             draft_answer = interaction_kwargs.get("draft_answer")
 
+    # Empty / unusable GT or rollout-marked invalid: zero reward, no fake transitions.
+    if reward_invalid or not target:
+        print(
+            "[refined answer: %s, draft answer: %s, ground truth: %s, "
+            "reward_invalid: True, score: 0.0, reason: empty_or_invalid_gold]"
+            % (answer, draft_answer, target)
+        )
+        return {
+            "score": 0.0,
+            "current_acc": 0.0,
+            "draft_acc": 0.0,
+            "transition": "00",
+            "p_10": _TRANSITION_STATS["10"] / max(1, _TRANSITION_STATS["total"]),
+            "p_01": _TRANSITION_STATS["01"] / max(1, _TRANSITION_STATS["total"]),
+            "gain": 0.0,
+            "format_penalty": 0.0,
+            "triple_repetition": float(triple_repetition),
+        }
+
+    # GenAcc for refined answer
+    if precomputed_refined is not None:
+        current_acc = float(precomputed_refined)
+    else:
+        current_acc = gen_acc(answer, target, use_judge=False)
+
     # GenAcc for draft answer
     if precomputed_draft is not None:
         draft_acc = float(precomputed_draft)
@@ -330,6 +378,17 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         draft_acc = gen_acc(draft_answer, target, use_judge=False)
     else:
         draft_acc = 0.0
+
+    # Identical draft/refined must share one label (defensive against judge noise).
+    same_answer = bool(rollout_scores.get("same_draft_refined")) or _answers_equivalent(
+        answer, draft_answer
+    )
+    if same_answer:
+        shared = current_acc if precomputed_refined is not None else (
+            draft_acc if precomputed_draft is not None else current_acc
+        )
+        current_acc = shared
+        draft_acc = shared
 
     # Four-quadrant configurable gain:
     # q00: draft=0 -> refined=0
@@ -379,7 +438,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     print(
         "[refined answer: %s, draft answer: %s, ground truth: %s, "
         "refined_acc: %s, draft_acc: %s, transition: %s, gain: %s, format_penalty: %s, "
-        "P(1->0): %.4f, P(0->1): %.4f, precomputed: %s]"
+        "P(1->0): %.4f, P(0->1): %.4f, precomputed: %s, same_answer: %s]"
         % (
             answer,
             draft_answer,
@@ -392,6 +451,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
             p_10,
             p_01,
             precomputed_refined is not None,
+            same_answer,
         )
     )
 
