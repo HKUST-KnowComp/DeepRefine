@@ -14,9 +14,9 @@
 
 <img src="assets/training_pip.png" alt="training pipeline" width="500">
 
-🤔 *Your LLM-Wiki Need to be Refined*
+🤔 *Your Knowledge Base Need to be Refined*
 
-**DeepRefine** is a general LLM-based reasoning model for agent-compiled knowledge refinement that improves the quality of any pre-constructed knowledge bases with user queries to make it more suitable for the downstream tasks.
+**DeepRefine** is a reinforcement learning framework for agentic knowledge refinement that evolves the quality of any pre-constructed structured knowledge bases, e.g., knowledge graphs or LLM-Wikis, with user interaction histories to make it more suitable for the downstream tasks.
 
 </div>
 
